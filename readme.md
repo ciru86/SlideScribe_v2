@@ -158,12 +158,6 @@ Examples:
 
 No runtime flag is currently exposed: this is a **hardcoded configuration**.
 
----
-
--------|------------| | WORKDIR | Output working directory | | VIDEO_URL | YouTube source | | VIDEO_BASENAME | Base name for all artifacts | | PROMPT | LLM correction prompt | | ROI_MODE | Optional slide region selection |
-
----
-
 ## Architecture
 
 The pipeline is intentionally split into deterministic and probabilistic stages.
