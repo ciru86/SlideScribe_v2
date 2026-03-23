@@ -11,6 +11,10 @@ import cv2
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
 
+Point = Tuple[int, int]
+RectROI = Tuple[int, int, int, int]
+QuadROI = np.ndarray  # shape (4, 2), float32 ordered TL, TR, BR, BL
+
 
 @dataclass
 class SlideCapture:
@@ -114,7 +118,22 @@ def write_csv(records: List[SlideCapture], out_csv: str) -> None:
             ])
 
 
-def interactive_select_named_roi(video_path: str, window_title: str, prompt: str) -> Tuple[int, int, int, int]:
+def clamp_roi(frame: np.ndarray, roi: RectROI) -> Tuple[int, int, int, int]:
+    h, w = frame.shape[:2]
+    x, y, rw, rh = roi
+    x1 = max(0, min(x, w - 1))
+    y1 = max(0, min(y, h - 1))
+    x2 = max(x1 + 1, min(x + rw, w))
+    y2 = max(y1 + 1, min(y + rh, h))
+    return x1, y1, x2, y2
+
+
+def crop_roi(frame: np.ndarray, roi: RectROI) -> np.ndarray:
+    x1, y1, x2, y2 = clamp_roi(frame, roi)
+    return frame[y1:y2, x1:x2].copy()
+
+
+def interactive_select_named_roi(video_path: str, window_title: str, prompt: str) -> RectROI:
     cap = cv2.VideoCapture(video_path)
     ok, frame = cap.read()
     cap.release()
@@ -143,27 +162,170 @@ def interactive_select_named_roi(video_path: str, window_title: str, prompt: str
     if rw == 0 or rh == 0:
         raise RuntimeError("ROI non selezionata.")
 
-    x = int(x / scale)
-    y = int(y / scale)
-    rw = int(rw / scale)
-    rh = int(rh / scale)
+    x = int(round(x / scale))
+    y = int(round(y / scale))
+    rw = int(round(rw / scale))
+    rh = int(round(rh / scale))
 
     return x, y, rw, rh
 
 
-def clamp_roi(frame: np.ndarray, roi: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+def order_quad_points(points: np.ndarray) -> QuadROI:
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.shape != (4, 2):
+        raise ValueError("Servono esattamente 4 punti.")
+
+    center = np.mean(pts, axis=0)
+    angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
+    ordered = pts[np.argsort(angles)]
+
+    sums = ordered[:, 0] + ordered[:, 1]
+    start_idx = int(np.argmin(sums))
+    ordered = np.roll(ordered, -start_idx, axis=0)
+
+    area2 = 0.0
+    for i in range(4):
+        x1, y1 = ordered[i]
+        x2, y2 = ordered[(i + 1) % 4]
+        area2 += (x1 * y2) - (x2 * y1)
+    if area2 < 0:
+        ordered = np.array([ordered[0], ordered[3], ordered[2], ordered[1]], dtype=np.float32)
+
+    return ordered.astype(np.float32)
+
+
+def distance(p1: np.ndarray, p2: np.ndarray) -> float:
+    return float(np.linalg.norm(p1 - p2))
+
+
+def quad_output_size(quad: QuadROI) -> Tuple[int, int]:
+    tl, tr, br, bl = quad
+    width = int(round((distance(tl, tr) + distance(bl, br)) / 2.0))
+    height = int(round((distance(tl, bl) + distance(tr, br)) / 2.0))
+    width = max(50, width)
+    height = max(50, height)
+    return width, height
+
+
+def clip_quad_to_frame(frame: np.ndarray, quad: QuadROI) -> QuadROI:
     h, w = frame.shape[:2]
-    x, y, rw, rh = roi
-    x1 = max(0, min(x, w - 1))
-    y1 = max(0, min(y, h - 1))
-    x2 = max(x1 + 1, min(x + rw, w))
-    y2 = max(y1 + 1, min(y + rh, h))
-    return x1, y1, x2, y2
+    clipped = quad.copy().astype(np.float32)
+    clipped[:, 0] = np.clip(clipped[:, 0], 0, w - 1)
+    clipped[:, 1] = np.clip(clipped[:, 1], 0, h - 1)
+    return clipped
 
 
-def crop_roi(frame: np.ndarray, roi: Tuple[int, int, int, int]) -> np.ndarray:
-    x1, y1, x2, y2 = clamp_roi(frame, roi)
-    return frame[y1:y2, x1:x2].copy()
+def warp_quad_to_rect(frame: np.ndarray, quad: QuadROI) -> np.ndarray:
+    quad = clip_quad_to_frame(frame, quad)
+    out_w, out_h = quad_output_size(quad)
+
+    dst = np.array([
+        [0, 0],
+        [out_w - 1, 0],
+        [out_w - 1, out_h - 1],
+        [0, out_h - 1],
+    ], dtype=np.float32)
+
+    matrix = cv2.getPerspectiveTransform(quad, dst)
+    warped = cv2.warpPerspective(frame, matrix, (out_w, out_h))
+    return warped
+
+
+def build_quad_preview(display_frame: np.ndarray, points: List[Point]) -> np.ndarray:
+    canvas = display_frame.copy()
+
+    instructions = [
+        "Click: 4 vertici slide | ENTER/SPACE conferma | R reset | ESC annulla",
+        "Dopo il 4° punto viene mostrata una preview rettificata",
+    ]
+    y = 28
+    for line in instructions:
+        cv2.putText(canvas, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 255, 255), 2, cv2.LINE_AA)
+        y += 28
+
+    for idx, pt in enumerate(points):
+        cv2.circle(canvas, pt, 6, (0, 0, 255), -1, lineType=cv2.LINE_AA)
+        cv2.putText(canvas, str(idx + 1), (pt[0] + 8, pt[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2, cv2.LINE_AA)
+
+    if len(points) >= 2:
+        pts_arr = np.array(points, dtype=np.int32)
+        cv2.polylines(canvas, [pts_arr], False, (0, 255, 0), 2, lineType=cv2.LINE_AA)
+
+    if len(points) == 4:
+        ordered = order_quad_points(np.array(points, dtype=np.float32))
+        quad_int = ordered.astype(np.int32)
+        cv2.polylines(canvas, [quad_int], True, (0, 255, 0), 2, lineType=cv2.LINE_AA)
+
+        warped = warp_quad_to_rect(display_frame, ordered)
+        preview_max_w = 420
+        preview_max_h = 260
+        wh, ww = warped.shape[:2]
+        scale = min(preview_max_w / ww, preview_max_h / wh, 1.0)
+        preview = cv2.resize(warped, (max(1, int(ww * scale)), max(1, int(wh * scale))), interpolation=cv2.INTER_AREA)
+
+        px = max(10, canvas.shape[1] - preview.shape[1] - 15)
+        py = max(80, 15)
+        cv2.rectangle(canvas, (px - 3, py - 25), (px + preview.shape[1] + 3, py + preview.shape[0] + 3), (255, 255, 255), 2)
+        cv2.putText(canvas, "Preview rettificata", (px, py - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+        canvas[py:py + preview.shape[0], px:px + preview.shape[1]] = preview
+
+    return canvas
+
+
+def interactive_select_quad(video_path: str, window_title: str, prompt: str) -> QuadROI:
+    cap = cv2.VideoCapture(video_path)
+    ok, frame = cap.read()
+    cap.release()
+
+    if not ok or frame is None:
+        raise RuntimeError("Impossibile leggere il primo frame del video.")
+
+    base_frame = frame.copy()
+    display_frame = base_frame.copy()
+    scale = 1.0
+    max_w = 1400
+    h, w = display_frame.shape[:2]
+    if w > max_w:
+        scale = max_w / w
+        display_frame = cv2.resize(
+            display_frame,
+            (int(w * scale), int(h * scale)),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    points: List[Point] = []
+
+    def on_mouse(event: int, x: int, y: int, flags: int, param: object) -> None:
+        nonlocal points
+        if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4:
+            points.append((x, y))
+
+    print(f"\n{prompt}\n")
+    print("Istruzioni: click su 4 vertici della slide. ENTER/SPACE conferma, R resetta, ESC annulla.")
+
+    cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(window_title, on_mouse)
+
+    while True:
+        canvas = build_quad_preview(display_frame, points)
+        cv2.imshow(window_title, canvas)
+        key = cv2.waitKey(20) & 0xFF
+
+        if key in (13, 32):
+            if len(points) == 4:
+                break
+        elif key in (ord('r'), ord('R')):
+            points = []
+        elif key == 27:
+            cv2.destroyWindow(window_title)
+            raise RuntimeError("Selezione quadrilatero annullata.")
+
+    cv2.destroyWindow(window_title)
+
+    pts = np.array(points, dtype=np.float32)
+    pts /= scale
+    pts = order_quad_points(pts)
+    return pts.astype(np.float32)
 
 
 def maybe_extract_candidate(
@@ -171,7 +333,7 @@ def maybe_extract_candidate(
     frame_idx: int,
     fps: float,
     total_frames: int,
-    trigger_roi: Tuple[int, int, int, int],
+    trigger_roi: RectROI,
     compare_baseline: np.ndarray,
     step_frames: int,
     stabilization_samples: int,
@@ -293,21 +455,30 @@ def extract_slides(
     print(f"Durata stimata: {duration_sec:.1f} s")
     print(f"Output directory: {output_dir}")
 
-    save_roi = interactive_select_named_roi(
+    slide_quad = interactive_select_quad(
         video_path,
-        "Seleziona area da salvare",
-        "Seleziona l'area della slide da salvare, poi premi INVIO o SPAZIO."
+        "Seleziona slide (4 vertici)",
+        "Seleziona i 4 vertici della slide da salvare. Dopo il 4° click vedrai la preview rettificata. Premi INVIO o SPAZIO per confermare."
     )
-    print(f"ROI save: x={save_roi[0]}, y={save_roi[1]}, w={save_roi[2]}, h={save_roi[3]}")
+    print("Slide quad ordinato (TL, TR, BR, BL):")
+    for i, (x, y) in enumerate(slide_quad, start=1):
+        print(f"  P{i}: x={x:.1f}, y={y:.1f}")
 
     if use_separate_trigger_roi:
         trigger_roi = interactive_select_named_roi(
             video_path,
             "Seleziona area trigger",
-            "Seleziona l'area da usare per rilevare il cambio slide, poi premi INVIO o SPAZIO."
+            "Seleziona l'area rettangolare da usare per rilevare il cambio slide, poi premi INVIO o SPAZIO."
         )
     else:
-        trigger_roi = save_roi
+        xs = slide_quad[:, 0]
+        ys = slide_quad[:, 1]
+        x1 = int(np.floor(np.min(xs)))
+        y1 = int(np.floor(np.min(ys)))
+        x2 = int(np.ceil(np.max(xs)))
+        y2 = int(np.ceil(np.max(ys)))
+        trigger_roi = (x1, y1, max(1, x2 - x1), max(1, y2 - y1))
+        print("Trigger ROI non separata: uso il bounding box rettangolare della quadrilatera slide.")
 
     print(f"ROI trigger: x={trigger_roi[0]}, y={trigger_roi[1]}, w={trigger_roi[2]}, h={trigger_roi[3]}")
 
@@ -329,15 +500,15 @@ def extract_slides(
         if not ok or frame is None:
             break
 
-        current_save_roi = crop_roi(frame, save_roi)
+        current_warped_slide = warp_quad_to_rect(frame, slide_quad)
         current_trigger_roi = crop_roi(frame, trigger_roi)
         time_sec = frame_idx / fps
 
         if prev_saved_roi is None:
             if save_first_slide:
-                img_to_save = current_save_roi if save_mode == "crop" else frame
+                img_to_save = current_warped_slide if save_mode == "crop" else frame
                 filename = save_image(img_to_save, output_dir, slide_index, time_sec)
-                records.append(SlideCapture(slide_index, time_sec, filename, current_save_roi))
+                records.append(SlideCapture(slide_index, time_sec, filename, current_warped_slide))
                 print(f"[SALVATA] Slide {slide_index} @ {time_sec:.1f}s -> {filename}")
                 slide_index += 1
 
@@ -367,12 +538,12 @@ def extract_slides(
 
                 if candidate is not None:
                     stable_frame, stable_time = candidate
-                    stable_save_roi = crop_roi(stable_frame, save_roi)
+                    stable_warped_slide = warp_quad_to_rect(stable_frame, slide_quad)
                     stable_trigger_roi = crop_roi(stable_frame, trigger_roi)
 
-                    img_to_save = stable_save_roi if save_mode == "crop" else stable_frame
+                    img_to_save = stable_warped_slide if save_mode == "crop" else stable_frame
                     filename = save_image(img_to_save, output_dir, slide_index, stable_time)
-                    records.append(SlideCapture(slide_index, stable_time, filename, stable_save_roi))
+                    records.append(SlideCapture(slide_index, stable_time, filename, stable_warped_slide))
 
                     print(
                         f"[SALVATA] Slide {slide_index} @ {stable_time:.1f}s "
@@ -400,7 +571,7 @@ def extract_slides(
     csv_path = os.path.join(output_dir, "slides.csv")
     write_csv(records, csv_path)
 
-    print(f"\nFatto.")
+    print("\nFatto.")
     print(f"Slide finali: {len(records)}")
     print(f"Cartella output: {output_dir}")
     print(f"CSV: {csv_path}")
@@ -408,7 +579,7 @@ def extract_slides(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Estrae le slide da un video quando cambia il contenuto dell'area selezionata."
+        description="Estrae le slide da un video quando cambia il contenuto dell'area trigger; la slide viene selezionata come quadrilatero e raddrizzata prima del salvataggio."
     )
 
     parser.add_argument("video", help="Percorso del file video")
@@ -463,7 +634,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--save-mode",
         choices=["crop", "full"],
         default="crop",
-        help="Salva solo la slide ritagliata oppure il frame intero (default: crop)"
+        help="Salva la slide rettificata oppure il frame intero (default: crop)"
     )
     parser.add_argument(
         "--dedup-ssim-threshold",
@@ -485,7 +656,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--separate-trigger-roi",
         action="store_true",
-        help="Permette di selezionare una ROI separata per il rilevamento del cambio slide"
+        help="Permette di selezionare una ROI trigger rettangolare separata; altrimenti usa il bounding box della quadrilatera slide"
     )
 
     return parser
