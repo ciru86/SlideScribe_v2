@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import List, Optional
 
 
+MIN_BLOCK_DURATION_SEC = 0.15
+
+
 @dataclass
 class Slide:
     slide_index: int
@@ -164,6 +167,11 @@ def parse_srt(path: Path) -> List[SRTBlock]:
             skipped_blocks += 1
             continue
 
+        duration = end_sec - start_sec
+        if duration < MIN_BLOCK_DURATION_SEC:
+            skipped_blocks += 1
+            continue
+
         blocks.append(
             SRTBlock(
                 index=idx,
@@ -254,13 +262,119 @@ def parse_slides_csv(path: Path) -> List[Slide]:
     return slides
 
 
-def find_slide_for_time(midpoint_sec: float, slides: List[Slide]) -> Slide:
+def find_slide_for_time(time_sec: float, slides: List[Slide]) -> Slide:
     for i in range(len(slides) - 1):
         cur = slides[i]
         nxt = slides[i + 1]
-        if cur.timestamp_sec <= midpoint_sec < nxt.timestamp_sec:
+        if cur.timestamp_sec <= time_sec < nxt.timestamp_sec:
             return cur
     return slides[-1]
+
+
+def _tokenize_for_overlap(text: str) -> List[str]:
+    text = normalize_whitespace(text).lower()
+    return re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE)
+
+
+def _find_overlap_token_count(
+    prev: str,
+    curr: str,
+    min_words: int = 2,
+    max_words: int = 30,
+) -> int:
+    prev = normalize_whitespace(prev)
+    curr = normalize_whitespace(curr)
+
+    if not prev or not curr:
+        return 0
+
+    if curr == prev:
+        return len(curr.split())
+
+    prev_words = prev.split()
+    curr_words = curr.split()
+    max_k = min(len(prev_words), len(curr_words), max_words)
+
+    # Tentativo 1: match esatto suffisso/prefisso a livello parole
+    for k in range(max_k, min_words - 1, -1):
+        if prev_words[-k:] == curr_words[:k]:
+            return k
+
+    # Tentativo 2: match "scorrevole" sui token normalizzati, così regge meglio
+    # casi tipo: "che abbiamo davanti" -> "abbiamo davanti. Per ..."
+    prev_tokens = _tokenize_for_overlap(prev)
+    curr_tokens = _tokenize_for_overlap(curr)
+
+    if not prev_tokens or not curr_tokens:
+        return 0
+
+    max_t = min(len(prev_tokens), len(curr_tokens), max_words * 3)
+    best_words = 0
+
+    for t in range(max_t, 0, -1):
+        if prev_tokens[-t:] != curr_tokens[:t]:
+            continue
+
+        overlap_text = "".join(
+            ch if re.match(r"[^\w\s]", ch, flags=re.UNICODE) else f" {ch}"
+            for ch in curr_tokens[:t]
+        )
+        overlap_text = normalize_whitespace(overlap_text)
+        overlap_words = len(overlap_text.split())
+
+        if overlap_words >= min_words:
+            best_words = overlap_words
+            break
+
+    return best_words
+
+
+def strip_overlap(prev: str, curr: str, min_words: int = 2, max_words: int = 30) -> str:
+    prev = normalize_whitespace(prev)
+    curr = normalize_whitespace(curr)
+
+    if not prev or not curr:
+        return curr
+
+    overlap_words = _find_overlap_token_count(
+        prev,
+        curr,
+        min_words=min_words,
+        max_words=max_words,
+    )
+
+    if overlap_words <= 0:
+        return curr
+
+    curr_words = curr.split()
+    if overlap_words >= len(curr_words):
+        return ""
+
+    trimmed = " ".join(curr_words[overlap_words:]).strip()
+    return normalize_whitespace(trimmed)
+
+
+def clean_slide_lines(lines: List[str]) -> List[str]:
+    out: List[str] = []
+    prev_raw: Optional[str] = None
+
+    for raw_line in lines:
+        raw_line = normalize_whitespace(raw_line)
+        if not raw_line:
+            continue
+
+        if prev_raw is None:
+            out.append(raw_line)
+            prev_raw = raw_line
+            continue
+
+        trimmed = strip_overlap(prev_raw, raw_line)
+        if trimmed:
+            out.append(trimmed)
+
+        prev_raw = raw_line
+
+    return dedupe_adjacent_lines(out)
 
 
 def aggregate_text_by_slide(
@@ -272,7 +386,7 @@ def aggregate_text_by_slide(
     for block in srt_blocks:
         if not block.text:
             continue
-        slide = find_slide_for_time(block.midpoint_sec, slides)
+        slide = find_slide_for_time(block.start_sec, slides)
         by_slide[slide.slide_index].append(block.text)
 
     return by_slide
@@ -290,7 +404,7 @@ def dedupe_adjacent_lines(lines: List[str]) -> List[str]:
 
 
 def join_slide_text(lines: List[str], empty_placeholder: str = "") -> str:
-    lines = dedupe_adjacent_lines(lines)
+    lines = clean_slide_lines(lines)
     lines = [normalize_whitespace(x) for x in lines]
     lines = [x for x in lines if x]
 
@@ -300,6 +414,42 @@ def join_slide_text(lines: List[str], empty_placeholder: str = "") -> str:
     text = " ".join(lines)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def dedupe_across_slides(
+    slides: List[Slide],
+    slide_text_map: dict[int, str],
+    empty_placeholder: str = "",
+) -> dict[int, str]:
+    if not slides:
+        return slide_text_map
+
+    cleaned = dict(slide_text_map)
+
+    for i in range(1, len(slides)):
+        prev_idx = slides[i - 1].slide_index
+        curr_idx = slides[i].slide_index
+
+        prev_text = normalize_whitespace(cleaned.get(prev_idx, ""))
+        curr_text = normalize_whitespace(cleaned.get(curr_idx, ""))
+
+        if not curr_text:
+            continue
+
+        trimmed_curr = strip_overlap(prev_text, curr_text, min_words=3, max_words=40)
+
+        # Secondo passaggio: se il blocco corrente è quasi tutto contenuto nella coda
+        # della slide precedente, scartalo del tutto.
+        if trimmed_curr:
+            prev_words = prev_text.split()
+            curr_words = curr_text.split()
+            tail = " ".join(prev_words[-min(len(prev_words), 50):])
+            if tail and curr_text and curr_text in tail:
+                trimmed_curr = ""
+
+        cleaned[curr_idx] = trimmed_curr if trimmed_curr else empty_placeholder
+
+    return cleaned
 
 
 def chunked(seq: List[Slide], size: int) -> List[List[Slide]]:
@@ -380,6 +530,13 @@ def main() -> int:
         if text.strip():
             non_empty_slides += 1
 
+    slide_text_map = dedupe_across_slides(
+        slides,
+        slide_text_map,
+        empty_placeholder=empty_placeholder,
+    )
+
+    non_empty_slides = sum(1 for text in slide_text_map.values() if text.strip())
     eprint(f"[INFO] Slide con testo non vuoto: {non_empty_slides}/{len(slides)}")
 
     slide_chunks = chunked(slides, chunk_size)
