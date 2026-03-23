@@ -104,22 +104,73 @@ prompt_choice_12() {
   done
 }
 
-prompt_multiline() {
-  local end_marker="ENDPROMPT"
-  local line
-  local content=""
+prompt_optional() {
+  local message="$1"
+  local value
+  printf "%s " "$message" > /dev/tty
+  IFS= read -r value < /dev/tty
+  value="$(trim "$value")"
+  printf '%s
+' "$value"
+}
 
-  echo "Incolla il prompt per ChatGPT." > /dev/tty
-  echo "Quando hai finito, scrivi una riga contenente solo: ${end_marker}" > /dev/tty
+build_llm_prompt() {
+  local lesson_topic="$1"
+  local terminology_context="$2"
+  local intro_line=""
+  local terminology_section=""
 
-  while IFS= read -r line < /dev/tty; do
-    [ "$line" = "$end_marker" ] && break
-    content+="${line}"$'\n'
-  done
+  if [[ -n "$lesson_topic" ]]; then
+    intro_line="Ti fornisco un file TXT strutturato in chunk di slide. È la sbobinatura di una lezione su **${lesson_topic}**, ottenuta da trascrizione automatica (Whisper / speech-to-text), quindi può contenere errori di trascrizione, punteggiatura imperfetta, termini tecnici sbagliati e frasi poco naturali."
+  else
+    intro_line="Ti fornisco un file TXT strutturato in chunk di slide. È la sbobinatura di una lezione ottenuta da trascrizione automatica (Whisper / speech-to-text), quindi può contenere errori di trascrizione, punteggiatura imperfetta, termini tecnici sbagliati e frasi poco naturali."
+  fi
 
-  content="${content%$'\n'}"
-  [ -n "$content" ] || die "Prompt vuoto"
-  printf '%s' "$content"
+  if [[ -n "$terminology_context" ]]; then
+    terminology_section=$(cat <<EOF
+
+Contesto terminologico:
+**${terminology_context}**
+EOF
+)
+  fi
+
+  cat <<EOF
+${intro_line}
+
+Il tuo compito è ripulire il testo associato a ciascuna slide, migliorandone la leggibilità, ma senza aggiungere contenuti non presenti nell’originale.
+
+Regole obbligatorie:
+- NON modificare i delimitatori di chunk
+- NON modificare le intestazioni del tipo `----- BEGIN SLIDE 0001 -----`
+- NON modificare le intestazioni del tipo `----- END SLIDE 0001 -----`
+- NON modificare la riga `TEXT:`
+- NON aggiungere o rimuovere slide
+- NON rinumerare le slide
+- NON aggiungere commenti, note, introduzioni o conclusioni
+- NON aggiungere concetti, spiegazioni, esempi o dettagli che non siano già presenti nel testo
+- NON completare arbitrariamente frasi tronche se il contenuto mancante non è chiaramente ricostruibile dal testo stesso
+- NON raccordare artificialmente una slide con la successiva o con la precedente
+- restituisci solo il file corretto, mantenendo identica la struttura di input
+
+Puoi modificare SOLO il testo sotto `TEXT:` per:
+- correggere errori di trascrizione
+- correggere termini tecnici
+- migliorare punteggiatura e leggibilità
+- riformulare frasi poco naturali o troppo orali in un italiano più chiaro e scorrevole
+- eliminare ripetizioni inutili o piccoli inciampi tipici del parlato, purché il significato resti invariato${terminology_section}
+
+Importante:
+- il chunk può iniziare o finire nel mezzo di un discorso
+- alcune frasi possono risultare incomplete perché continuano nella slide successiva o nel chunk successivo
+- in questi casi migliora il testo solo se possibile senza inventare il contenuto mancante
+- se una correzione non è sicura, mantieni una versione prudente e vicina all’originale
+
+Obiettivo finale:
+produrre un testo più leggibile, ma semanticamente fedele all’originale.
+
+Restituisci esclusivamente il testo corretto nello stesso identico formato ricevuto.
+EOF
 }
 
 validate_youtube_url() {
@@ -220,7 +271,9 @@ validate_youtube_url "$YOUTUBE_URL" || die "URL YouTube non valido o non accessi
 log "URL verificato"
 
 VIDEO_BASENAME="$(prompt_nonempty "Come vuoi chiamare il video finale (senza estensione)? ")"
-PROMPT_TEXT="$(prompt_multiline)"
+LESSON_TOPIC="$(prompt_optional "Inserisci l'argomento della lezione (lascia vuoto per usare la versione generica del prompt):")"
+TERMINOLOGY_CONTEXT="$(prompt_optional "Inserisci il contesto terminologico, se utile (lascia vuoto per omettere l'intera sezione):")"
+PROMPT_TEXT="$(build_llm_prompt "$LESSON_TOPIC" "$TERMINOLOGY_CONTEXT")"
 
 # ============================================================
 # PATH PRINCIPALI
