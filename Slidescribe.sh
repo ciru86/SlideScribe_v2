@@ -2,29 +2,83 @@
 set -euo pipefail
 
 # ============================================================
-# CONFIG
+# Slidescribe - pipeline YouTube -> slide screenshots -> LLM cleanup -> PDF/DOCX
+#
+# Precedence:
+#   CLI flags > config file > built-in defaults > interactive prompts
+#
+# Notes:
+# - Interactive prompts are used only when a required value is still missing
+#   and --non-interactive is NOT enabled.
+# - --prompt-file replaces the built-in LLM prompt entirely.
+# - --from-step defines the starting point of the pipeline.
+# - --skip-* removes individual steps from the active execution plan.
+# - --force-all forces re-execution of active steps even if checkpoint files exist.
 # ============================================================
-SCREENSHOT_SCRIPT="Screenshot_grabber.py"
-EXPORT_SCRIPT="export_for_llm.py"
-IMPORT_SCRIPT="import_corrected_for_pdf_docx.py"
-PDF_SCRIPT="slides_and_texts_to_pdf.py"
-
-MODEL="gpt-5.4"
-TEMPERATURE="0.5"
-MAX_OUTPUT_TOKENS="70000"
-VERBOSITY="low"
-CHUNK_SIZE="20"
-USE_SAFARI_COOKIES=0
-VERBOSE_LOGS=0
-YTDLP_FALLBACK_PATH="$HOME/.local/bin/yt-dlp"
 
 # ============================================================
-# PATH PROGETTO / PYTHON DEL VENV
+# SCRIPT / TOOL FILES
 # ============================================================
+SCREENSHOT_SCRIPT="modules/Screenshot_grabber.py"
+EXPORT_SCRIPT="modules/export_for_llm.py"
+IMPORT_SCRIPT="modules/import_corrected_for_pdf_docx.py"
+PDF_SCRIPT="modules/slides_and_texts_to_pdf.py"
+
+# ============================================================
+# DEFAULTS
+# ============================================================
+SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 VENV_PYTHON="${SCRIPT_DIR}/.venv/bin/python"
+YTDLP_FALLBACK_PATH="$HOME/.local/bin/yt-dlp"
+YTDLP_CMD=()
+
+MODEL="gpt-5.4"
+TEMPERATURE="0.3"
+MAX_OUTPUT_TOKENS="70000"
+EFFORT=""
+VERBOSITY="normal"
+CHUNK_SIZE="20"
+YTDLP_MODE="auto"              # auto | system | fallback
+SUB_LANGS="it,it-IT,it.*,ita"
+COOKIES_FROM_BROWSER=""
+ROI_MODE=""                    # shared | separate
+WORKDIR=""
+YOUTUBE_URL=""
+VIDEO_BASENAME=""
+LESSON_TOPIC=""
+TERMINOLOGY_CONTEXT=""
+TERMINOLOGY_FILE=""
+PROMPT_FILE=""
+CONFIG_FILE=""
+
+NON_INTERACTIVE=0
+DRY_RUN=0
+FORCE_ALL=0
+KEEP_INTERMEDIATE_SRTS=0
+KEEP_RAW_JSON=0
+KEEP_TEMP=0
+
+SKIP_DOWNLOAD=0
+SKIP_SUBS=0
+SKIP_SCREENSHOTS=0
+SKIP_LLM=0
+SKIP_PDF=0
+FROM_STEP=""                   # screenshots | llm | pdf
+
+# verbosity-derived logging
+VERBOSE_LOGS=0
+DEBUG_LOGS=0
+QUIET_LOGS=0
+
+# runtime derived / globals used later
+PROMPT_TEXT=""
+DOWNLOADED_SRT=""
+SCREENSHOTS_NEEDED=1
+LLM_PIPELINE_NEEDED=1
+PDF_NEEDED=1
 
 # ============================================================
 # UTILITY
@@ -34,8 +88,21 @@ die() {
   exit 1
 }
 
+warn() {
+  echo "Avviso: $*" >&2
+}
+
 log() {
+  if [ "$QUIET_LOGS" -eq 1 ]; then
+    return 0
+  fi
   printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >&2
+}
+
+debug() {
+  if [ "$DEBUG_LOGS" -eq 1 ]; then
+    printf '[%s] DEBUG: %s\n' "$(date '+%H:%M:%S')" "$*" >&2
+  fi
 }
 
 require_command() {
@@ -80,6 +147,11 @@ backup_file_if_exists() {
 prompt_nonempty() {
   local label="$1"
   local value=""
+
+  if [ "$NON_INTERACTIVE" -eq 1 ]; then
+    die "Parametro obbligatorio mancante in modalità --non-interactive: ${label}"
+  fi
+
   while true; do
     printf "%s" "$label" > /dev/tty
     IFS= read -r value < /dev/tty
@@ -90,30 +162,223 @@ prompt_nonempty() {
   printf '%s' "$value"
 }
 
-prompt_choice_12() {
+prompt_optional() {
+  local message="$1"
+  local value
+
+  if [ "$NON_INTERACTIVE" -eq 1 ]; then
+    printf ''
+    return 0
+  fi
+
+  printf "%s " "$message" > /dev/tty
+  IFS= read -r value < /dev/tty
+  value="$(trim "$value")"
+  printf '%s\n' "$value"
+}
+
+prompt_choice_roi() {
   local value=""
+
+  if [ "$NON_INTERACTIVE" -eq 1 ]; then
+    die "ROI mode mancante in modalità --non-interactive"
+  fi
+
   while true; do
-    printf "Seleziona modalità ROI (1 = Slide Area e Trigger Area uguali e rettangolari, 2 = Slide Area ≠ Trigger Area e Slide Area poligonale ): " > /dev/tty
+    printf "Seleziona modalità ROI (shared = Slide Area e Trigger Area uguali e rettangolari, separate = Slide Area ≠ Trigger Area e Slide Area poligonale): " > /dev/tty
     IFS= read -r value < /dev/tty
+    value="$(trim "$value")"
     case "$value" in
-      1|2)
+      shared|separate)
         printf '%s' "$value"
         return 0
         ;;
+      1)
+        printf 'shared'
+        return 0
+        ;;
+      2)
+        printf 'separate'
+        return 0
+        ;;
       *)
-        echo "Devi digitare 1 oppure 2." > /dev/tty
+        echo "Devi digitare shared oppure separate (accettati anche 1/2)." > /dev/tty
         ;;
     esac
   done
 }
 
-prompt_optional() {
-  local message="$1"
-  local value
-  printf "%s " "$message" > /dev/tty
-  IFS= read -r value < /dev/tty
-  value="$(trim "$value")"
-  printf '%s\n' "$value"
+usage() {
+  cat <<'EOF'
+Uso:
+  Slidescribe.sh [opzioni]
+
+Input principali:
+  --workdir PATH
+  --youtube-url URL
+  --video-basename NAME
+  --lesson-topic TEXT
+  --terminology-context TEXT
+  --terminology-file FILE
+  --prompt-file FILE
+  --sub-langs "it,it-IT,it.*,ita"
+
+Modalità operative:
+  --roi-mode shared|separate
+  --ytdlp-mode auto|system|fallback
+  --cookies-from-browser BROWSER
+  --non-interactive
+  --dry-run
+  --from-step screenshots|llm|pdf
+  --skip-download
+  --skip-subs
+  --skip-screenshots
+  --skip-llm
+  --skip-pdf
+  --force-all
+
+LLM:
+  --model NAME
+  --temperature FLOAT
+  --max-output-tokens N
+  --effort VALUE
+  --verbosity quiet|normal|verbose|debug
+  --chunk-size N
+
+Conservazione / debug:
+  --keep-intermediate-srts
+  --keep-raw-json
+  --keep-temp
+
+Config:
+  --config FILE
+
+Altre:
+  -h, --help
+  --manual
+
+Esempi:
+  Slidescribe.sh \
+    --workdir ~/Desktop/lezione1 \
+    --youtube-url "https://www.youtube.com/watch?v=..." \
+    --video-basename "lezione1" \
+    --lesson-topic "OSAS, MAD, CPAP" \
+    --terminology-file ~/glossari/osas.txt \
+    --roi-mode separate
+
+  Slidescribe.sh --config run.conf --temperature 0.5 --verbosity debug
+  Slidescribe.sh --config run.conf --from-step llm --force-all
+  Slidescribe.sh --config run.conf --non-interactive --dry-run
+
+Per una descrizione completa delle interazioni tra flag, usa:
+  Slidescribe.sh --manual
+EOF
+}
+
+manual() {
+  cat <<'EOF'
+MANUALE
+========
+
+1) PRECEDENZA CONFIGURAZIONE
+   CLI flags > --config FILE > default interni > prompt interattivo
+
+   Esempio:
+     nel config hai TEMPERATURE="0.3"
+     da CLI passi --temperature 0.6
+     risultato finale: 0.6
+
+2) INTERATTIVITÀ
+   - Senza --non-interactive, i parametri mancanti vengono chiesti a terminale.
+   - Con --non-interactive, i parametri obbligatori mancanti causano errore.
+
+3) --prompt-file
+   Sostituisce completamente il prompt LLM built-in.
+   Non lo estende. Non viene fuso con il prompt standard.
+
+4) --terminology-context e --terminology-file
+   Possono convivere.
+   Se presenti entrambi:
+     - il file viene letto come base
+     - il testo inline viene aggiunto in fondo
+
+5) --from-step
+   Definisce il punto di partenza della pipeline:
+     screenshots  = pipeline completa dal task screenshot in avanti
+     llm          = salta download/sottotitoli/screenshots e parte dalla pipeline LLM
+     pdf          = salta tutto e parte solo dalla generazione PDF/DOCX
+
+   Equivalenze logiche:
+     --from-step llm  => skip download + skip subs + skip screenshots
+     --from-step pdf  => skip download + skip subs + skip screenshots + skip llm
+
+6) --skip-*
+   Rimuove singoli step dal piano di esecuzione.
+
+   Esempi:
+     --skip-pdf       = esegue pipeline fino al JSON finale, ma non genera PDF/DOCX
+     --skip-llm       = non esegue correzione LLM/import; utile solo se esiste già il JSON finale
+
+7) INTERAZIONI TRA --from-step, --skip-*, --force-all
+   Ordine concettuale:
+     a) --from-step definisce il perimetro iniziale
+     b) --skip-* rimuove step dal perimetro
+     c) --force-all forza la riesecuzione degli step rimasti nel perimetro
+
+   Esempi validi:
+     --from-step llm --force-all
+       -> rifà LLM + PDF anche se esistono checkpoint
+
+     --from-step llm --skip-pdf
+       -> rifà solo LLM, non il PDF
+
+   Esempi invalidi:
+     --from-step llm --skip-llm
+     --from-step pdf --skip-pdf
+
+8) --force-all
+   Ignora i checkpoint degli step ATTIVI.
+   Non riattiva step esclusi da --from-step o --skip-*.
+
+9) YT-DLP MODE
+   auto      = prova yt-dlp in PATH; se fallisce, prova fallback ~/.local/bin/yt-dlp
+   system    = usa solo yt-dlp in PATH; nessun fallback
+   fallback  = usa direttamente ~/.local/bin/yt-dlp
+
+10) --cookies-from-browser BROWSER
+   Aggiunge --cookies-from-browser <BROWSER> al comando yt-dlp selezionato.
+   Esempi: Safari, Brave, Firefox
+
+11) VERBOSITY
+   quiet   = output minimo
+   normal  = log standard
+   verbose = log standard + output live dei task principali
+   debug   = verbose + messaggi diagnostici extra
+
+12) CONFIG FILE
+   Formato consigliato: shell-compatible .conf
+
+   Esempio:
+     WORKDIR="/Users/corax/Desktop/lezione1"
+     YOUTUBE_URL="https://www.youtube.com/watch?v=..."
+     YTDLP_MODE="auto"
+     SUB_LANGS="it,it-IT,it.*,ita"
+     VIDEO_BASENAME="lezione1"
+     LESSON_TOPIC="OSAS, MAD, CPAP"
+     TERMINOLOGY_FILE="/Users/corax/glossari/osas.txt"
+     ROI_MODE="shared"
+     CHUNK_SIZE="20"
+     MODEL="gpt-5.4"
+     TEMPERATURE="0.3"
+     MAX_OUTPUT_TOKENS="70000"
+     EFFORT=""
+     VERBOSITY="normal"
+     COOKIES_FROM_BROWSER="Safari"
+     KEEP_RAW_JSON="1"
+
+13) DRY RUN
+   Risolve configurazione, controlla coerenza, stampa il piano di esecuzione e termina.
+EOF
 }
 
 build_llm_prompt() {
@@ -145,10 +410,10 @@ Il tuo compito è ripulire il testo associato a ciascuna slide, migliorandone la
 Regole obbligatorie:
 - NON modificare i delimitatori di chunk
 - NON modificare le intestazioni del tipo \
-`----- BEGIN SLIDE 0001 -----`
+\`----- BEGIN SLIDE 0001 -----\`
 - NON modificare le intestazioni del tipo \
-`----- END SLIDE 0001 -----`
-- NON modificare la riga `TEXT:`
+\`----- END SLIDE 0001 -----\`
+- NON modificare la riga \`TEXT:\`
 - NON aggiungere o rimuovere slide
 - NON rinumerare le slide
 - NON aggiungere commenti, note, introduzioni o conclusioni
@@ -157,7 +422,7 @@ Regole obbligatorie:
 - NON raccordare artificialmente una slide con la successiva o con la precedente
 - restituisci solo il file corretto, mantenendo identica la struttura di input
 
-Puoi modificare SOLO il testo sotto `TEXT:` per:
+Puoi modificare SOLO il testo sotto \`TEXT:\` per:
 - correggere errori di trascrizione
 - correggere termini tecnici
 - migliorare punteggiatura e leggibilità
@@ -183,15 +448,12 @@ extract_json_field_with_python() {
 
   JSON_INPUT="$json_input" python3 - "$field" <<'PY'
 import json, os, sys
-
 field = sys.argv[1]
 raw = os.environ["JSON_INPUT"]
-
 try:
     data = json.loads(raw)
 except Exception:
     sys.exit(2)
-
 value = data.get(field, "")
 if isinstance(value, str):
     print(value)
@@ -205,7 +467,6 @@ count_slides_from_csv() {
 import csv
 import sys
 from pathlib import Path
-
 path = Path(sys.argv[1])
 with path.open("r", encoding="utf-8-sig", newline="") as f:
     reader = csv.DictReader(f)
@@ -217,12 +478,27 @@ PY
 cleanup_intermediate_srts() {
   local path
 
+  if [ "$KEEP_INTERMEDIATE_SRTS" -eq 1 ]; then
+    log "Conservazione SRT intermedi abilitata: nessun cleanup SRT"
+    return 0
+  fi
+
   for path in "$IT_SRT" "$IT_ORIG_SRT"; do
     if [ -f "$path" ]; then
       rm -f "$path"
       log "Rimosso SRT intermedio: $path"
     fi
   done
+}
+
+cleanup_temp_files() {
+  if [ "$KEEP_TEMP" -eq 1 ]; then
+    log "Conservazione file temporanei abilitata: nessun cleanup temp"
+    return 0
+  fi
+
+  # Placeholder per eventuali temp futuri: al momento i log vengono sempre conservati.
+  true
 }
 
 move_final_outputs_to_workdir() {
@@ -243,35 +519,165 @@ move_final_outputs_to_workdir() {
   log "DOCX spostato in: $FINAL_DOCX"
 }
 
-usage() {
-  cat <<'EOF'
-Uso:
-  Slidescribe_v2.3.sh [opzioni]
+load_config_file() {
+  local config_path="$1"
+  [ -n "$config_path" ] || return 0
+  [ -f "$config_path" ] || die "Config file non trovato: $config_path"
 
-Opzioni:
-  --cookie           Usa yt-dlp con --cookies-from-browser Safari
-  -v, --verbose      Mostra a schermo i log “umani”; Screenshot_grabber va live anche a terminale
-  -h, --help         Mostra questo aiuto
+  debug "Carico config file: $config_path"
+  # shellcheck disable=SC1090
+  source "$config_path"
 
-Nota yt-dlp fallback:
-  Se yt-dlp fallisce, lo script prova automaticamente ~/.local/bin/yt-dlp
-  aggiungendo anche:
-    --cookies-from-browser Safari
-    --impersonate Safari-26.0:Macos-26
-EOF
+  # importa solo le variabili previste, se definite nel config
+  WORKDIR="${WORKDIR:-$WORKDIR}"
+  YOUTUBE_URL="${YOUTUBE_URL:-$YOUTUBE_URL}"
+  YTDLP_MODE="${YTDLP_MODE:-$YTDLP_MODE}"
+  SUB_LANGS="${SUB_LANGS:-$SUB_LANGS}"
+  VIDEO_BASENAME="${VIDEO_BASENAME:-$VIDEO_BASENAME}"
+  LESSON_TOPIC="${LESSON_TOPIC:-$LESSON_TOPIC}"
+  TERMINOLOGY_CONTEXT="${TERMINOLOGY_CONTEXT:-$TERMINOLOGY_CONTEXT}"
+  TERMINOLOGY_FILE="${TERMINOLOGY_FILE:-$TERMINOLOGY_FILE}"
+  ROI_MODE="${ROI_MODE:-$ROI_MODE}"
+  CHUNK_SIZE="${CHUNK_SIZE:-$CHUNK_SIZE}"
+  MODEL="${MODEL:-$MODEL}"
+  TEMPERATURE="${TEMPERATURE:-$TEMPERATURE}"
+  MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-$MAX_OUTPUT_TOKENS}"
+  EFFORT="${EFFORT:-$EFFORT}"
+  VERBOSITY="${VERBOSITY:-$VERBOSITY}"
+  COOKIES_FROM_BROWSER="${COOKIES_FROM_BROWSER:-$COOKIES_FROM_BROWSER}"
+  PROMPT_FILE="${PROMPT_FILE:-$PROMPT_FILE}"
+  KEEP_INTERMEDIATE_SRTS="${KEEP_INTERMEDIATE_SRTS:-$KEEP_INTERMEDIATE_SRTS}"
+  KEEP_RAW_JSON="${KEEP_RAW_JSON:-$KEEP_RAW_JSON}"
+  KEEP_TEMP="${KEEP_TEMP:-$KEEP_TEMP}"
+  SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-$SKIP_DOWNLOAD}"
+  SKIP_SUBS="${SKIP_SUBS:-$SKIP_SUBS}"
+  SKIP_SCREENSHOTS="${SKIP_SCREENSHOTS:-$SKIP_SCREENSHOTS}"
+  SKIP_LLM="${SKIP_LLM:-$SKIP_LLM}"
+  SKIP_PDF="${SKIP_PDF:-$SKIP_PDF}"
+  FROM_STEP="${FROM_STEP:-$FROM_STEP}"
+  FORCE_ALL="${FORCE_ALL:-$FORCE_ALL}"
+  NON_INTERACTIVE="${NON_INTERACTIVE:-$NON_INTERACTIVE}"
+  DRY_RUN="${DRY_RUN:-$DRY_RUN}"
 }
 
 parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --cookie)
-        USE_SAFARI_COOKIES=1
+      --workdir)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --workdir"
+        WORKDIR="$1"
         ;;
-      -v|--verbose)
-        VERBOSE_LOGS=1
+      --youtube-url)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --youtube-url"
+        YOUTUBE_URL="$1"
+        ;;
+      --video-basename)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --video-basename"
+        VIDEO_BASENAME="$1"
+        ;;
+      --lesson-topic)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --lesson-topic"
+        LESSON_TOPIC="$1"
+        ;;
+      --terminology-context)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --terminology-context"
+        TERMINOLOGY_CONTEXT="$1"
+        ;;
+      --terminology-file)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --terminology-file"
+        TERMINOLOGY_FILE="$1"
+        ;;
+      --roi-mode)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --roi-mode"
+        ROI_MODE="$1"
+        ;;
+      --chunk-size)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --chunk-size"
+        CHUNK_SIZE="$1"
+        ;;
+      --sub-langs)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --sub-langs"
+        SUB_LANGS="$1"
+        ;;
+      --ytdlp-mode)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --ytdlp-mode"
+        YTDLP_MODE="$1"
+        ;;
+      --cookies-from-browser)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --cookies-from-browser"
+        COOKIES_FROM_BROWSER="$1"
+        ;;
+      --model)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --model"
+        MODEL="$1"
+        ;;
+      --temperature)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --temperature"
+        TEMPERATURE="$1"
+        ;;
+      --max-output-tokens)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --max-output-tokens"
+        MAX_OUTPUT_TOKENS="$1"
+        ;;
+      --effort)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --effort"
+        EFFORT="$1"
+        ;;
+      --verbosity)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --verbosity"
+        VERBOSITY="$1"
+        ;;
+      --prompt-file)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --prompt-file"
+        PROMPT_FILE="$1"
+        ;;
+      --config)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --config"
+        CONFIG_FILE="$1"
+        ;;
+      --keep-intermediate-srts)
+        KEEP_INTERMEDIATE_SRTS=1
+        ;;
+      --keep-raw-json)
+        KEEP_RAW_JSON=1
+        ;;
+      --keep-temp)
+        KEEP_TEMP=1
+        ;;
+      --skip-download)
+        SKIP_DOWNLOAD=1
+        ;;
+      --skip-subs)
+        SKIP_SUBS=1
+        ;;
+      --skip-screenshots)
+        SKIP_SCREENSHOTS=1
+        ;;
+      --skip-llm)
+        SKIP_LLM=1
+        ;;
+      --skip-pdf)
+        SKIP_PDF=1
+        ;;
+      --from-step)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --from-step"
+        FROM_STEP="$1"
+        ;;
+      --force-all)
+        FORCE_ALL=1
+        ;;
+      --non-interactive)
+        NON_INTERACTIVE=1
+        ;;
+      --dry-run)
+        DRY_RUN=1
         ;;
       -h|--help)
         usage
+        exit 0
+        ;;
+      --manual)
+        manual
         exit 0
         ;;
       *)
@@ -280,6 +686,194 @@ parse_args() {
     esac
     shift
   done
+}
+
+apply_verbosity_mode() {
+  case "$VERBOSITY" in
+    quiet)
+      QUIET_LOGS=1
+      VERBOSE_LOGS=0
+      DEBUG_LOGS=0
+      ;;
+    normal)
+      QUIET_LOGS=0
+      VERBOSE_LOGS=0
+      DEBUG_LOGS=0
+      ;;
+    verbose)
+      QUIET_LOGS=0
+      VERBOSE_LOGS=1
+      DEBUG_LOGS=0
+      ;;
+    debug)
+      QUIET_LOGS=0
+      VERBOSE_LOGS=1
+      DEBUG_LOGS=1
+      ;;
+    *)
+      die "Valore non valido per --verbosity: $VERBOSITY (attesi: quiet|normal|verbose|debug)"
+      ;;
+  esac
+}
+
+validate_number() {
+  local label="$1"
+  local value="$2"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$label deve essere un intero positivo: $value"
+}
+
+validate_float() {
+  local label="$1"
+  local value="$2"
+  [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "$label deve essere un numero valido: $value"
+}
+
+normalize_and_validate_args() {
+  case "$YTDLP_MODE" in
+    auto|system|fallback) ;;
+    *) die "Valore non valido per --ytdlp-mode: $YTDLP_MODE (attesi: auto|system|fallback)" ;;
+  esac
+
+  if [ -n "$ROI_MODE" ]; then
+    case "$ROI_MODE" in
+      1) ROI_MODE="shared" ;;
+      2) ROI_MODE="separate" ;;
+      shared|separate) ;;
+      *) die "Valore non valido per --roi-mode: $ROI_MODE (attesi: shared|separate)" ;;
+    esac
+  fi
+
+  if [ -n "$FROM_STEP" ]; then
+    case "$FROM_STEP" in
+      screenshots|llm|pdf) ;;
+      *) die "Valore non valido per --from-step: $FROM_STEP (attesi: screenshots|llm|pdf)" ;;
+    esac
+  fi
+
+  validate_number "--chunk-size" "$CHUNK_SIZE"
+  validate_number "--max-output-tokens" "$MAX_OUTPUT_TOKENS"
+  validate_float "--temperature" "$TEMPERATURE"
+
+  [ -z "$TERMINOLOGY_FILE" ] || require_file "$TERMINOLOGY_FILE"
+  [ -z "$PROMPT_FILE" ] || require_file "$PROMPT_FILE"
+
+  if [ "$YTDLP_MODE" = "system" ]; then
+    require_command yt-dlp
+  fi
+  if [ "$YTDLP_MODE" = "fallback" ]; then
+    [ -x "$YTDLP_FALLBACK_PATH" ] || die "yt-dlp fallback non disponibile/eseguibile: $YTDLP_FALLBACK_PATH"
+  fi
+
+  # expand from-step into logical skip defaults
+  case "$FROM_STEP" in
+    screenshots|"")
+      ;;
+    llm)
+      SKIP_DOWNLOAD=1
+      SKIP_SUBS=1
+      SKIP_SCREENSHOTS=1
+      ;;
+    pdf)
+      SKIP_DOWNLOAD=1
+      SKIP_SUBS=1
+      SKIP_SCREENSHOTS=1
+      SKIP_LLM=1
+      ;;
+  esac
+
+  # invalid combinations
+  if [ "$FROM_STEP" = "llm" ] && [ "$SKIP_LLM" -eq 1 ]; then
+    die "Combinazione non valida: --from-step llm con --skip-llm"
+  fi
+  if [ "$FROM_STEP" = "pdf" ] && [ "$SKIP_PDF" -eq 1 ]; then
+    die "Combinazione non valida: --from-step pdf con --skip-pdf"
+  fi
+}
+
+resolve_inputs() {
+  if [ -z "$WORKDIR" ]; then
+    WORKDIR="$(prompt_nonempty 'Inserisci il path della cartella di lavoro: ')"
+    WORKDIR="${WORKDIR//\\ / }"
+  fi
+
+  mkdir -p "$WORKDIR"
+  WORKDIR="$(cd "$WORKDIR" && pwd)"
+}
+
+  if [ "$SKIP_DOWNLOAD" -eq 0 ] || [ "$SKIP_SUBS" -eq 0 ]; then
+    if [ -z "$YOUTUBE_URL" ]; then
+      YOUTUBE_URL="$(prompt_nonempty 'Inserisci URL video YouTube: ')"
+    fi
+  fi
+
+  if [ -z "$VIDEO_BASENAME" ]; then
+    VIDEO_BASENAME="$(prompt_nonempty 'Come vuoi chiamare il video finale (senza estensione)? ')"
+  fi
+
+  if [ -z "$LESSON_TOPIC" ]; then
+    LESSON_TOPIC="$(prompt_optional "Inserisci l'argomento della lezione (lascia vuoto per usare la versione generica del prompt):")"
+  fi
+
+  if [ -z "$TERMINOLOGY_CONTEXT" ] && [ -z "$TERMINOLOGY_FILE" ]; then
+    TERMINOLOGY_CONTEXT="$(prompt_optional "Inserisci il contesto terminologico, se utile (lascia vuoto per omettere l'intera sezione):")"
+  fi
+
+  if [ "$SKIP_SCREENSHOTS" -eq 0 ] && [ -z "$ROI_MODE" ]; then
+    ROI_MODE="$(prompt_choice_roi)"
+  fi
+
+  if [ -n "$TERMINOLOGY_FILE" ]; then
+    local terminology_file_content
+    terminology_file_content="$(cat "$TERMINOLOGY_FILE")"
+    if [ -n "$TERMINOLOGY_CONTEXT" ]; then
+      TERMINOLOGY_CONTEXT="${terminology_file_content}
+
+${TERMINOLOGY_CONTEXT}"
+    else
+      TERMINOLOGY_CONTEXT="$terminology_file_content"
+    fi
+  fi
+
+  if [ -n "$PROMPT_FILE" ]; then
+    PROMPT_TEXT="$(cat "$PROMPT_FILE")"
+  else
+    PROMPT_TEXT="$(build_llm_prompt "$LESSON_TOPIC" "$TERMINOLOGY_CONTEXT")"
+  fi
+}
+
+setup_paths() {
+  VIDEO_PATH="${WORKDIR}/${VIDEO_BASENAME}.mkv"
+  ORIGINAL_SRT="${WORKDIR}/${VIDEO_BASENAME}.original.srt"
+  IT_SRT="${WORKDIR}/${VIDEO_BASENAME}.it.srt"
+  IT_ORIG_SRT="${WORKDIR}/${VIDEO_BASENAME}.it-orig.srt"
+
+  SLIDES_DIR="${WORKDIR}/${VIDEO_BASENAME} slides"
+
+  FINAL_PDF_IN_SLIDES="${SLIDES_DIR}/${VIDEO_BASENAME}.pdf"
+  FINAL_DOCX_IN_SLIDES="${SLIDES_DIR}/${VIDEO_BASENAME}.docx"
+  FINAL_PDF="${WORKDIR}/${VIDEO_BASENAME}.pdf"
+  FINAL_DOCX="${WORKDIR}/${VIDEO_BASENAME}.docx"
+
+  LLM_CHUNKS_DIR="${WORKDIR}/llm_chunks"
+  LLM_CORRECTED_DIR="${WORKDIR}/llm_corrected"
+  LLM_MERGED_DIR="${WORKDIR}/llm_merged"
+  MERGED_SLIDE_TEXTS_JSON="${LLM_MERGED_DIR}/${VIDEO_BASENAME}.slide_texts.json"
+
+  LOG_DIR="${WORKDIR}/logs"
+  mkdir -p "$LOG_DIR" "$LLM_CHUNKS_DIR" "$LLM_CORRECTED_DIR" "$LLM_MERGED_DIR"
+
+  SCREENSHOT_STDOUT="${LOG_DIR}/screenshot.stdout.log"
+  SCREENSHOT_STDERR="${LOG_DIR}/screenshot.stderr.log"
+  EXPORT_STDOUT="${LOG_DIR}/export.stdout.log"
+  EXPORT_STDERR="${LOG_DIR}/export.stderr.log"
+  CHATGPT_UPLOAD_STDERR="${LOG_DIR}/chatgpt_upload.stderr.log"
+  CHATGPT_RUN_STDERR="${LOG_DIR}/chatgpt_run.stderr.log"
+  IMPORT_STDOUT="${LOG_DIR}/import.stdout.log"
+  IMPORT_STDERR="${LOG_DIR}/import.stderr.log"
+  PDF_STDOUT="${LOG_DIR}/pdf.stdout.log"
+  PDF_STDERR="${LOG_DIR}/pdf.stderr.log"
+  YTDLP_VIDEO_STDERR="${LOG_DIR}/ytdlp_video.stderr.log"
+  YTDLP_SUBS_STDERR="${LOG_DIR}/ytdlp_subs.stderr.log"
 }
 
 run_logged_command() {
@@ -297,62 +891,89 @@ run_logged_command() {
   fi
 }
 
-run_ytdlp_with_fallback() {
+build_ytdlp_command() {
+  local mode="$1"
+
+  YTDLP_CMD=()
+
+  case "$mode" in
+    system)
+      YTDLP_CMD=(yt-dlp --no-playlist)
+      ;;
+    fallback)
+      YTDLP_CMD=("$YTDLP_FALLBACK_PATH" --no-playlist)
+      ;;
+    auto)
+      YTDLP_CMD=(yt-dlp --no-playlist)
+      ;;
+    *)
+      die "build_ytdlp_command: mode non valido: $mode"
+      ;;
+  esac
+
+  if [ -n "$COOKIES_FROM_BROWSER" ]; then
+    YTDLP_CMD+=(--cookies-from-browser "$COOKIES_FROM_BROWSER")
+  fi
+}
+
+run_ytdlp_with_policy() {
   local stderr_log="$1"
   local action_label="$2"
   shift 2
 
-  local -a base_cmd
-  local -a fallback_cmd
+  local -a primary_cmd=()
+  local -a fallback_cmd=()
   local rc=0
 
-  base_cmd=(yt-dlp --no-playlist)
-  if [ "$USE_SAFARI_COOKIES" -eq 1 ]; then
-    base_cmd+=(--cookies-from-browser Safari)
-  fi
+  if [ "$YTDLP_MODE" = "auto" ]; then
+    build_ytdlp_command system
+    primary_cmd=("${YTDLP_CMD[@]}")
+    debug "yt-dlp primary (${action_label}): ${primary_cmd[*]} $*"
+    : > "$stderr_log"
 
-  fallback_cmd=("$YTDLP_FALLBACK_PATH" --no-playlist --cookies-from-browser Safari --impersonate "Safari-26.0:Macos-26")
+    set +e
+    "${primary_cmd[@]}" "$@" 2> >(tee -a "$stderr_log" >&2)
+    rc=$?
+    set -e
 
-  if [ "$VERBOSE_LOGS" -eq 1 ]; then
-    log "yt-dlp primario (${action_label}): ${base_cmd[*]} $*"
-  fi
+    if [ $rc -eq 0 ]; then
+      return 0
+    fi
 
-  : > "$stderr_log"
+    log "yt-dlp primario fallito per ${action_label} (exit ${rc}). Provo fallback: $YTDLP_FALLBACK_PATH"
+    [ -x "$YTDLP_FALLBACK_PATH" ] || die "yt-dlp primario fallito e fallback non disponibile/eseguibile: $YTDLP_FALLBACK_PATH"
 
-  set +e
-  "${base_cmd[@]}" "$@" 2> >(tee -a "$stderr_log" >&2)
-  rc=$?
-  set -e
+    build_ytdlp_command fallback
+    fallback_cmd=("${YTDLP_CMD[@]}")
+    debug "yt-dlp fallback (${action_label}): ${fallback_cmd[*]} $*"
 
-  if [ $rc -eq 0 ]; then
+    set +e
+    "${fallback_cmd[@]}" "$@" 2> >(tee -a "$stderr_log" >&2)
+    rc=$?
+    set -e
+
+    [ $rc -eq 0 ] || die "yt-dlp fallito anche col fallback per ${action_label} (exit ${rc}). Vedi log: $stderr_log"
     return 0
   fi
 
-  log "yt-dlp primario fallito per ${action_label} (exit ${rc}). Provo fallback: $YTDLP_FALLBACK_PATH"
-
-  if [ ! -x "$YTDLP_FALLBACK_PATH" ]; then
-    die "yt-dlp primario fallito e fallback non disponibile/eseguibile: $YTDLP_FALLBACK_PATH"
-  fi
-
-  if [ "$VERBOSE_LOGS" -eq 1 ]; then
-    log "yt-dlp fallback (${action_label}): ${fallback_cmd[*]} $*"
-  fi
+  build_ytdlp_command "$YTDLP_MODE"
+  primary_cmd=("${YTDLP_CMD[@]}")
+  debug "yt-dlp (${action_label}): ${primary_cmd[*]} $*"
+  : > "$stderr_log"
 
   set +e
-  "${fallback_cmd[@]}" "$@" 2> >(tee -a "$stderr_log" >&2)
+  "${primary_cmd[@]}" "$@" 2> >(tee -a "$stderr_log" >&2)
   rc=$?
   set -e
 
-  if [ $rc -ne 0 ]; then
-    die "yt-dlp fallito anche col fallback per ${action_label} (exit ${rc}). Vedi log: $stderr_log"
-  fi
+  [ $rc -eq 0 ] || die "yt-dlp fallito per ${action_label} (exit ${rc}). Vedi log: $stderr_log"
 }
 
 validate_youtube_url() {
   local url="$1"
   local validation_log
   validation_log="${TMPDIR:-/tmp}/slidescribe_validate_ytdlp.$$.stderr.log"
-  run_ytdlp_with_fallback "$validation_log" "validazione URL" --simulate --skip-download -- "$url" >/dev/null
+  run_ytdlp_with_policy "$validation_log" "validazione URL" --simulate --skip-download -- "$url" >/dev/null
   rm -f "$validation_log"
 }
 
@@ -366,96 +987,130 @@ run_chatgpt_upload() {
   fi
 }
 
-# ============================================================
-# ARGOMENTI CLI
-# ============================================================
-parse_args "$@"
+check_dependencies() {
+  require_command chatgpt
+  require_command python3
+  require_command find
+  require_command sort
+  require_command head
+  require_command tee
+  require_file "$VENV_PYTHON"
+  require_file "${SCRIPT_DIR}/${SCREENSHOT_SCRIPT}"
+  require_file "${SCRIPT_DIR}/${EXPORT_SCRIPT}"
+  require_file "${SCRIPT_DIR}/${IMPORT_SCRIPT}"
+  require_file "${SCRIPT_DIR}/${PDF_SCRIPT}"
+
+  case "$YTDLP_MODE" in
+    auto|system)
+      require_command yt-dlp
+      ;;
+  esac
+}
+
+compute_checkpoints() {
+  SCREENSHOTS_NEEDED=1
+  LLM_PIPELINE_NEEDED=1
+  PDF_NEEDED=1
+
+  if [ "$FORCE_ALL" -eq 0 ] && [ "$SKIP_SCREENSHOTS" -eq 0 ]; then
+    if [ -d "$SLIDES_DIR" ] && [ -f "${SLIDES_DIR}/slides.csv" ] && [ -s "${SLIDES_DIR}/slides.csv" ]; then
+      log "Slide e slides.csv già presenti, skip Screenshot_grabber: $SLIDES_DIR"
+      SCREENSHOTS_NEEDED=0
+    else
+      log "Cartella slide non trovata o incompleta: Screenshot_grabber verrà eseguito"
+    fi
+  fi
+
+  if [ "$FORCE_ALL" -eq 0 ] && [ "$SKIP_LLM" -eq 0 ]; then
+    if file_exists_nonempty "$MERGED_SLIDE_TEXTS_JSON"; then
+      log "Slide texts JSON già presente, skip pipeline LLM: $MERGED_SLIDE_TEXTS_JSON"
+      LLM_PIPELINE_NEEDED=0
+    else
+      log "Slide texts JSON da generare"
+    fi
+  fi
+
+  if [ "$FORCE_ALL" -eq 0 ] && [ "$SKIP_PDF" -eq 0 ]; then
+    if file_exists_nonempty "$FINAL_PDF" && file_exists_nonempty "$FINAL_DOCX"; then
+      log "PDF e DOCX finali già presenti, skip generazione finale"
+      PDF_NEEDED=0
+    fi
+  fi
+}
+
+print_resolved_config() {
+  cat <<EOF
+=== CONFIGURAZIONE RISOLTA ===
+WORKDIR="$WORKDIR"
+YOUTUBE_URL="$YOUTUBE_URL"
+VIDEO_BASENAME="$VIDEO_BASENAME"
+LESSON_TOPIC="$LESSON_TOPIC"
+TERMINOLOGY_FILE="$TERMINOLOGY_FILE"
+ROI_MODE="$ROI_MODE"
+CHUNK_SIZE="$CHUNK_SIZE"
+SUB_LANGS="$SUB_LANGS"
+YTDLP_MODE="$YTDLP_MODE"
+COOKIES_FROM_BROWSER="$COOKIES_FROM_BROWSER"
+MODEL="$MODEL"
+TEMPERATURE="$TEMPERATURE"
+MAX_OUTPUT_TOKENS="$MAX_OUTPUT_TOKENS"
+EFFORT="$EFFORT"
+VERBOSITY="$VERBOSITY"
+PROMPT_FILE="$PROMPT_FILE"
+KEEP_INTERMEDIATE_SRTS="$KEEP_INTERMEDIATE_SRTS"
+KEEP_RAW_JSON="$KEEP_RAW_JSON"
+KEEP_TEMP="$KEEP_TEMP"
+SKIP_DOWNLOAD="$SKIP_DOWNLOAD"
+SKIP_SUBS="$SKIP_SUBS"
+SKIP_SCREENSHOTS="$SKIP_SCREENSHOTS"
+SKIP_LLM="$SKIP_LLM"
+SKIP_PDF="$SKIP_PDF"
+FROM_STEP="$FROM_STEP"
+FORCE_ALL="$FORCE_ALL"
+NON_INTERACTIVE="$NON_INTERACTIVE"
+DRY_RUN="$DRY_RUN"
+EOF
+}
+
+print_execution_plan() {
+  cat <<EOF
+=== PIANO DI ESECUZIONE ===
+DOWNLOAD VIDEO:     $( [ "$SKIP_DOWNLOAD" -eq 1 ] && echo SKIP || echo ACTIVE )
+DOWNLOAD SUBS:      $( [ "$SKIP_SUBS" -eq 1 ] && echo SKIP || echo ACTIVE )
+SCREENSHOTS:        $( [ "$SKIP_SCREENSHOTS" -eq 1 ] && echo SKIP || echo ACTIVE )
+LLM PIPELINE:       $( [ "$SKIP_LLM" -eq 1 ] && echo SKIP || echo ACTIVE )
+PDF/DOCX:           $( [ "$SKIP_PDF" -eq 1 ] && echo SKIP || echo ACTIVE )
+CHECKPOINTS FORZATI $( [ "$FORCE_ALL" -eq 1 ] && echo YES || echo NO )
+EOF
+}
+
+ensure_prerequisites_for_skips() {
+  if [ "$SKIP_SCREENSHOTS" -eq 1 ]; then
+    [ -d "$SLIDES_DIR" ] || die "Hai skippato gli screenshot ma la cartella slide non esiste: $SLIDES_DIR"
+    [ -f "${SLIDES_DIR}/slides.csv" ] || die "Hai skippato gli screenshot ma manca slides.csv: ${SLIDES_DIR}/slides.csv"
+  fi
+
+  if [ "$SKIP_LLM" -eq 1 ]; then
+    [ -f "$MERGED_SLIDE_TEXTS_JSON" ] || die "Hai skippato la pipeline LLM ma manca il JSON finale: $MERGED_SLIDE_TEXTS_JSON"
+  fi
+}
 
 # ============================================================
-# CHECK DIPENDENZE
+# TASKS
 # ============================================================
-require_command yt-dlp
-require_command chatgpt
-require_command python3
-require_command find
-require_command sort
-require_command head
-require_command tee
+step_download_video() {
+  if [ "$SKIP_DOWNLOAD" -eq 1 ]; then
+    log "Download video skippato"
+    return 0
+  fi
 
-require_file "$VENV_PYTHON"
-require_file "${SCRIPT_DIR}/${SCREENSHOT_SCRIPT}"
-require_file "${SCRIPT_DIR}/${EXPORT_SCRIPT}"
-require_file "${SCRIPT_DIR}/${IMPORT_SCRIPT}"
-require_file "${SCRIPT_DIR}/${PDF_SCRIPT}"
+  if [ "$FORCE_ALL" -eq 0 ] && file_exists_nonempty "$VIDEO_PATH"; then
+    log "Video già presente, skip download: $VIDEO_PATH"
+    return 0
+  fi
 
-# ============================================================
-# INPUT UTENTE
-# ============================================================
-WORKDIR_INPUT="$(prompt_nonempty "Inserisci il path della cartella di lavoro: ")"
-mkdir -p "$WORKDIR_INPUT"
-WORKDIR="$(cd "$WORKDIR_INPUT" && pwd)"
-log "Cartella di lavoro: $WORKDIR"
-
-YOUTUBE_URL="$(prompt_nonempty "Inserisci URL video YouTube: ")"
-validate_youtube_url "$YOUTUBE_URL" || die "URL YouTube non valido o non accessibile con yt-dlp"
-log "URL verificato"
-[ "$USE_SAFARI_COOKIES" -eq 1 ] && log "Cookie Safari abilitati per yt-dlp"
-[ "$VERBOSE_LOGS" -eq 1 ] && log "Modalità verbose abilitata: i log verranno mostrati anche a schermo"
-
-VIDEO_BASENAME="$(prompt_nonempty "Come vuoi chiamare il video finale (senza estensione)? ")"
-LESSON_TOPIC="$(prompt_optional "Inserisci l'argomento della lezione (lascia vuoto per usare la versione generica del prompt):")"
-TERMINOLOGY_CONTEXT="$(prompt_optional "Inserisci il contesto terminologico, se utile (lascia vuoto per omettere l'intera sezione):")"
-PROMPT_TEXT="$(build_llm_prompt "$LESSON_TOPIC" "$TERMINOLOGY_CONTEXT")"
-
-# ============================================================
-# PATH PRINCIPALI
-# ============================================================
-VIDEO_PATH="${WORKDIR}/${VIDEO_BASENAME}.mkv"
-ORIGINAL_SRT="${WORKDIR}/${VIDEO_BASENAME}.original.srt"
-IT_SRT="${WORKDIR}/${VIDEO_BASENAME}.it.srt"
-IT_ORIG_SRT="${WORKDIR}/${VIDEO_BASENAME}.it-orig.srt"
-
-SLIDES_DIR="${WORKDIR}/${VIDEO_BASENAME} slides"
-
-FINAL_PDF_IN_SLIDES="${SLIDES_DIR}/${VIDEO_BASENAME}.pdf"
-FINAL_DOCX_IN_SLIDES="${SLIDES_DIR}/${VIDEO_BASENAME}.docx"
-FINAL_PDF="${WORKDIR}/${VIDEO_BASENAME}.pdf"
-FINAL_DOCX="${WORKDIR}/${VIDEO_BASENAME}.docx"
-
-LLM_CHUNKS_DIR="${WORKDIR}/llm_chunks"
-LLM_CORRECTED_DIR="${WORKDIR}/llm_corrected"
-LLM_MERGED_DIR="${WORKDIR}/llm_merged"
-MERGED_SLIDE_TEXTS_JSON="${LLM_MERGED_DIR}/${VIDEO_BASENAME}.slide_texts.json"
-
-LOG_DIR="${WORKDIR}/logs"
-mkdir -p "$LOG_DIR" "$LLM_CHUNKS_DIR" "$LLM_CORRECTED_DIR" "$LLM_MERGED_DIR"
-
-SCREENSHOT_STDOUT="${LOG_DIR}/screenshot.stdout.log"
-SCREENSHOT_STDERR="${LOG_DIR}/screenshot.stderr.log"
-
-EXPORT_STDOUT="${LOG_DIR}/export.stdout.log"
-EXPORT_STDERR="${LOG_DIR}/export.stderr.log"
-
-CHATGPT_UPLOAD_STDERR="${LOG_DIR}/chatgpt_upload.stderr.log"
-CHATGPT_RUN_STDERR="${LOG_DIR}/chatgpt_run.stderr.log"
-
-IMPORT_STDOUT="${LOG_DIR}/import.stdout.log"
-IMPORT_STDERR="${LOG_DIR}/import.stderr.log"
-
-PDF_STDOUT="${LOG_DIR}/pdf.stdout.log"
-PDF_STDERR="${LOG_DIR}/pdf.stderr.log"
-
-YTDLP_VIDEO_STDERR="${LOG_DIR}/ytdlp_video.stderr.log"
-YTDLP_SUBS_STDERR="${LOG_DIR}/ytdlp_subs.stderr.log"
-
-# ============================================================
-# STEP 1: VIDEO
-# ============================================================
-if file_exists_nonempty "$VIDEO_PATH"; then
-  log "Video già presente, skip download: $VIDEO_PATH"
-else
   log "Download video in massima qualità + remux MKV..."
-  run_ytdlp_with_fallback "$YTDLP_VIDEO_STDERR" "download video" \
+  run_ytdlp_with_policy "$YTDLP_VIDEO_STDERR" "download video" \
     -f "bv*+ba/b" \
     --remux-video mkv \
     -o "${WORKDIR}/${VIDEO_BASENAME}.%(ext)s" \
@@ -463,67 +1118,53 @@ else
 
   require_file "$VIDEO_PATH"
   log "Video pronto: $VIDEO_PATH"
-fi
+}
 
-# ============================================================
-# STEP 2: SOTTOTITOLI ORIGINALI
-# ============================================================
-if file_exists_nonempty "$ORIGINAL_SRT"; then
-  log "SRT originale già presente, skip download: $ORIGINAL_SRT"
-else
-  log "Download sottotitoli automatici italiani + conversione SRT..."
-  run_ytdlp_with_fallback "$YTDLP_SUBS_STDERR" "download sottotitoli" \
+step_download_subs() {
+  if [ "$SKIP_SUBS" -eq 1 ]; then
+    log "Download sottotitoli skippato"
+    return 0
+  fi
+
+  if [ "$FORCE_ALL" -eq 0 ] && file_exists_nonempty "$ORIGINAL_SRT"; then
+    log "SRT originale già presente, skip download: $ORIGINAL_SRT"
+    return 0
+  fi
+
+  log "Download sottotitoli automatici + conversione SRT..."
+  run_ytdlp_with_policy "$YTDLP_SUBS_STDERR" "download sottotitoli" \
     --skip-download \
     --write-auto-subs \
-    --sub-langs "it,it-IT,it.*,ita" \
+    --sub-langs "$SUB_LANGS" \
     --convert-subs srt \
     -o "${WORKDIR}/${VIDEO_BASENAME}.%(ext)s" \
     -- "$YOUTUBE_URL"
 
   DOWNLOADED_SRT="$({
     find "$WORKDIR" -maxdepth 1 -type f \
-      \( -name "${VIDEO_BASENAME}*.it*.srt" -o -name "${VIDEO_BASENAME}*.srt" \) \
+      \( -name "${VIDEO_BASENAME}*.srt" \) \
       | sort | head -n 1
   })"
 
   [ -n "${DOWNLOADED_SRT:-}" ] || die "Nessun file SRT trovato dopo il download dei sottotitoli"
-
   cp -f "$DOWNLOADED_SRT" "$ORIGINAL_SRT"
   require_file "$ORIGINAL_SRT"
   log "SRT originale pronto: $ORIGINAL_SRT"
-fi
+}
 
-# ============================================================
-# CHECKPOINT / RESUME
-# ============================================================
-screenshots_needed=1
-llm_pipeline_needed=1
-
-if [ -d "$SLIDES_DIR" ] && [ -f "${SLIDES_DIR}/slides.csv" ] && [ -s "${SLIDES_DIR}/slides.csv" ]; then
-  log "Slide e slides.csv già presenti, skip Screenshot_grabber: $SLIDES_DIR"
-  screenshots_needed=0
-else
-  log "Cartella slide non trovata o incompleta: Screenshot_grabber verrà eseguito"
-fi
-
-if file_exists_nonempty "$MERGED_SLIDE_TEXTS_JSON"; then
-  log "Slide texts JSON già presente, skip pipeline LLM: $MERGED_SLIDE_TEXTS_JSON"
-  llm_pipeline_needed=0
-else
-  log "Slide texts JSON da generare"
-fi
-
-if [ "$screenshots_needed" -eq 1 ]; then
-  ROI_MODE="$(prompt_choice_12)"
-else
-  ROI_MODE=""
-fi
-
-# ============================================================
-# TASK 1: SCREENSHOT GRABBER
-# ============================================================
 task_screenshots() {
   local -a cmd
+
+  if [ "$SKIP_SCREENSHOTS" -eq 1 ]; then
+    log "Screenshot_grabber skippato"
+    return 0
+  fi
+
+  if [ "$SCREENSHOTS_NEEDED" -eq 0 ]; then
+    log "Screenshot_grabber non necessario"
+    return 0
+  fi
+
   cmd=(
     "$VENV_PYTHON"
     -u
@@ -532,7 +1173,7 @@ task_screenshots() {
     -o "$SLIDES_DIR"
   )
 
-  if [ "$ROI_MODE" = "2" ]; then
+  if [ "$ROI_MODE" = "separate" ]; then
     cmd+=(--separate-trigger-roi)
   fi
 
@@ -546,9 +1187,6 @@ task_screenshots() {
   [ -s "${SLIDES_DIR}/slides.csv" ] || die "Screenshot_grabber terminato ma slides.csv è vuoto: ${SLIDES_DIR}/slides.csv"
 }
 
-# ============================================================
-# TASK 2: EXPORT + CHATGPT CHUNKS + IMPORT
-# ============================================================
 run_llm_pipeline() {
   local slides_csv="${SLIDES_DIR}/slides.csv"
   local expected_slides
@@ -558,6 +1196,17 @@ run_llm_pipeline() {
   local upload_json
   local file_id
   local raw_json_path
+  local -a chatgpt_cmd
+
+  if [ "$SKIP_LLM" -eq 1 ]; then
+    log "Pipeline LLM skippata"
+    return 0
+  fi
+
+  if [ "$LLM_PIPELINE_NEEDED" -eq 0 ]; then
+    log "Pipeline LLM non necessaria"
+    return 0
+  fi
 
   require_file "$slides_csv"
   require_file "$ORIGINAL_SRT"
@@ -588,7 +1237,6 @@ run_llm_pipeline() {
   shopt -s nullglob
   local chunk_files=( "$LLM_CHUNKS_DIR"/"${VIDEO_BASENAME}".chunk_*.txt )
   shopt -u nullglob
-
   [ "${#chunk_files[@]}" -gt 0 ] || die "Nessun chunk generato in $LLM_CHUNKS_DIR"
 
   for chunk_file in "${chunk_files[@]}"; do
@@ -596,42 +1244,42 @@ run_llm_pipeline() {
     corrected_file="${LLM_CORRECTED_DIR}/${chunk_basename}.corrected.txt"
     raw_json_path="${LLM_CORRECTED_DIR}/${chunk_basename}.raw.json"
 
-    if file_exists_nonempty "$corrected_file"; then
+    if [ "$FORCE_ALL" -eq 0 ] && file_exists_nonempty "$corrected_file"; then
       log "Chunk corretto già presente, skip: $corrected_file"
       continue
     fi
 
     log "Upload chunk a ChatGPT: $chunk_file"
     upload_json="$(run_chatgpt_upload "$chunk_file")"
-
     file_id="$(extract_json_field_with_python "$upload_json" "id")"
     [ -n "$file_id" ] || die "Impossibile estrarre file_id per chunk: $chunk_file"
 
     log "Invio prompt a ChatGPT per chunk: $chunk_basename"
+    chatgpt_cmd=(
+      chatgpt
+      --no-resume
+      -o "$corrected_file"
+      --file-id "$file_id"
+      -m "$MODEL"
+      -t "$TEMPERATURE"
+      -k "$MAX_OUTPUT_TOKENS"
+      --verbosity "$VERBOSITY"
+    )
+
+    if [ -n "$EFFORT" ]; then
+      chatgpt_cmd+=(--effort "$EFFORT")
+    fi
+
+    if [ "$KEEP_RAW_JSON" -eq 1 ]; then
+      chatgpt_cmd+=(--save-raw "$raw_json_path")
+    fi
+
+    chatgpt_cmd+=("$PROMPT_TEXT")
+
     if [ "$VERBOSE_LOGS" -eq 1 ]; then
-      chatgpt \
-        --no-resume \
-        --save-raw "$raw_json_path" \
-        -o "$corrected_file" \
-        --file-id "$file_id" \
-        -m "$MODEL" \
-        -t "$TEMPERATURE" \
-        -k "$MAX_OUTPUT_TOKENS" \
-        --verbosity "$VERBOSITY" \
-        "$PROMPT_TEXT" \
-        2> >(tee -a "$CHATGPT_RUN_STDERR" >&2)
+      "${chatgpt_cmd[@]}" 2> >(tee -a "$CHATGPT_RUN_STDERR" >&2)
     else
-      chatgpt \
-        --no-resume \
-        --save-raw "$raw_json_path" \
-        -o "$corrected_file" \
-        --file-id "$file_id" \
-        -m "$MODEL" \
-        -t "$TEMPERATURE" \
-        -k "$MAX_OUTPUT_TOKENS" \
-        --verbosity "$VERBOSITY" \
-        "$PROMPT_TEXT" \
-        2>>"$CHATGPT_RUN_STDERR"
+      "${chatgpt_cmd[@]}" 2>>"$CHATGPT_RUN_STDERR"
     fi
 
     require_file "$corrected_file"
@@ -659,67 +1307,202 @@ run_llm_pipeline() {
   log "JSON finale slide texts pronto: $MERGED_SLIDE_TEXTS_JSON"
 }
 
-# ============================================================
-# ESECUZIONE SEQUENZIALE
-# ============================================================
-if [ "$screenshots_needed" -eq 1 ]; then
-  log "Eseguo Screenshot_grabber..."
-  task_screenshots
-else
-  log "Screenshot_grabber non necessario"
-fi
+step_generate_pdf() {
+  if [ "$SKIP_PDF" -eq 1 ]; then
+    log "Generazione PDF/DOCX skippata"
+    return 0
+  fi
 
-require_dir "$SLIDES_DIR"
-require_file "${SLIDES_DIR}/slides.csv"
+  if [ "$PDF_NEEDED" -eq 0 ]; then
+    log "Generazione PDF/DOCX non necessaria"
+    return 0
+  fi
 
-if [ "$llm_pipeline_needed" -eq 1 ]; then
-  log "Eseguo pipeline LLM..."
-  run_llm_pipeline
-else
-  log "Pipeline LLM non necessaria"
-fi
+  require_dir "$SLIDES_DIR"
+  require_file "${SLIDES_DIR}/slides.csv"
+  require_file "$MERGED_SLIDE_TEXTS_JSON"
 
-# ============================================================
-# CHECK POST-TASK
-# ============================================================
-require_dir "$SLIDES_DIR"
-require_file "${SLIDES_DIR}/slides.csv"
-require_file "$MERGED_SLIDE_TEXTS_JSON"
-
-# ============================================================
-# STEP FINALE: PDF / DOCX
-# ============================================================
-log "Avvio slides_and_texts_to_pdf.py..."
-
-if [ "$VERBOSE_LOGS" -eq 1 ]; then
-  run_logged_command "$PDF_STDOUT" "$PDF_STDERR" 1 \
+  log "Avvio slides_and_texts_to_pdf.py..."
+  if [ "$VERBOSE_LOGS" -eq 1 ]; then
+    run_logged_command "$PDF_STDOUT" "$PDF_STDERR" 1 \
+      "$VENV_PYTHON" "${SCRIPT_DIR}/${PDF_SCRIPT}" \
+      --input-dir "$SLIDES_DIR" \
+      --csv "slides.csv" \
+      --slide-texts "$MERGED_SLIDE_TEXTS_JSON" \
+      --output-base "$VIDEO_BASENAME"
+  else
     "$VENV_PYTHON" "${SCRIPT_DIR}/${PDF_SCRIPT}" \
-    --input-dir "$SLIDES_DIR" \
-    --csv "slides.csv" \
-    --slide-texts "$MERGED_SLIDE_TEXTS_JSON" \
-    --output-base "$VIDEO_BASENAME"
-else
-  "$VENV_PYTHON" "${SCRIPT_DIR}/${PDF_SCRIPT}" \
-    --input-dir "$SLIDES_DIR" \
-    --csv "slides.csv" \
-    --slide-texts "$MERGED_SLIDE_TEXTS_JSON" \
-    --output-base "$VIDEO_BASENAME" \
-    >"$PDF_STDOUT" 2>"$PDF_STDERR"
+      --input-dir "$SLIDES_DIR" \
+      --csv "slides.csv" \
+      --slide-texts "$MERGED_SLIDE_TEXTS_JSON" \
+      --output-base "$VIDEO_BASENAME" \
+      >"$PDF_STDOUT" 2>"$PDF_STDERR"
+  fi
+
+  move_final_outputs_to_workdir
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+PRESET_WORKDIR="$WORKDIR"
+PRESET_YOUTUBE_URL="$YOUTUBE_URL"
+PRESET_VIDEO_BASENAME="$VIDEO_BASENAME"
+PRESET_LESSON_TOPIC="$LESSON_TOPIC"
+PRESET_TERMINOLOGY_CONTEXT="$TERMINOLOGY_CONTEXT"
+PRESET_TERMINOLOGY_FILE="$TERMINOLOGY_FILE"
+PRESET_ROI_MODE="$ROI_MODE"
+PRESET_CHUNK_SIZE="$CHUNK_SIZE"
+PRESET_SUB_LANGS="$SUB_LANGS"
+PRESET_YTDLP_MODE="$YTDLP_MODE"
+PRESET_COOKIES_FROM_BROWSER="$COOKIES_FROM_BROWSER"
+PRESET_MODEL="$MODEL"
+PRESET_TEMPERATURE="$TEMPERATURE"
+PRESET_MAX_OUTPUT_TOKENS="$MAX_OUTPUT_TOKENS"
+PRESET_EFFORT="$EFFORT"
+PRESET_VERBOSITY="$VERBOSITY"
+PRESET_PROMPT_FILE="$PROMPT_FILE"
+
+parse_args "$@"
+
+# load config after parsing just to know CONFIG_FILE, then re-apply CLI overrides explicitly
+if [ -n "$CONFIG_FILE" ]; then
+  # save CLI overrides before sourcing config
+  CLI_WORKDIR="$WORKDIR"
+  CLI_YOUTUBE_URL="$YOUTUBE_URL"
+  CLI_VIDEO_BASENAME="$VIDEO_BASENAME"
+  CLI_LESSON_TOPIC="$LESSON_TOPIC"
+  CLI_TERMINOLOGY_CONTEXT="$TERMINOLOGY_CONTEXT"
+  CLI_TERMINOLOGY_FILE="$TERMINOLOGY_FILE"
+  CLI_ROI_MODE="$ROI_MODE"
+  CLI_CHUNK_SIZE="$CHUNK_SIZE"
+  CLI_SUB_LANGS="$SUB_LANGS"
+  CLI_YTDLP_MODE="$YTDLP_MODE"
+  CLI_COOKIES_FROM_BROWSER="$COOKIES_FROM_BROWSER"
+  CLI_MODEL="$MODEL"
+  CLI_TEMPERATURE="$TEMPERATURE"
+  CLI_MAX_OUTPUT_TOKENS="$MAX_OUTPUT_TOKENS"
+  CLI_EFFORT="$EFFORT"
+  CLI_VERBOSITY="$VERBOSITY"
+  CLI_PROMPT_FILE="$PROMPT_FILE"
+  CLI_KEEP_INTERMEDIATE_SRTS="$KEEP_INTERMEDIATE_SRTS"
+  CLI_KEEP_RAW_JSON="$KEEP_RAW_JSON"
+  CLI_KEEP_TEMP="$KEEP_TEMP"
+  CLI_SKIP_DOWNLOAD="$SKIP_DOWNLOAD"
+  CLI_SKIP_SUBS="$SKIP_SUBS"
+  CLI_SKIP_SCREENSHOTS="$SKIP_SCREENSHOTS"
+  CLI_SKIP_LLM="$SKIP_LLM"
+  CLI_SKIP_PDF="$SKIP_PDF"
+  CLI_FROM_STEP="$FROM_STEP"
+  CLI_FORCE_ALL="$FORCE_ALL"
+  CLI_NON_INTERACTIVE="$NON_INTERACTIVE"
+  CLI_DRY_RUN="$DRY_RUN"
+
+  # reset to defaults, then load config, then re-apply CLI values only when they differ from defaults or boolean set to 1
+  WORKDIR="$PRESET_WORKDIR"
+  YOUTUBE_URL="$PRESET_YOUTUBE_URL"
+  VIDEO_BASENAME="$PRESET_VIDEO_BASENAME"
+  LESSON_TOPIC="$PRESET_LESSON_TOPIC"
+  TERMINOLOGY_CONTEXT="$PRESET_TERMINOLOGY_CONTEXT"
+  TERMINOLOGY_FILE="$PRESET_TERMINOLOGY_FILE"
+  ROI_MODE="$PRESET_ROI_MODE"
+  CHUNK_SIZE="$PRESET_CHUNK_SIZE"
+  SUB_LANGS="$PRESET_SUB_LANGS"
+  YTDLP_MODE="$PRESET_YTDLP_MODE"
+  COOKIES_FROM_BROWSER="$PRESET_COOKIES_FROM_BROWSER"
+  MODEL="$PRESET_MODEL"
+  TEMPERATURE="$PRESET_TEMPERATURE"
+  MAX_OUTPUT_TOKENS="$PRESET_MAX_OUTPUT_TOKENS"
+  EFFORT="$PRESET_EFFORT"
+  VERBOSITY="$PRESET_VERBOSITY"
+  PROMPT_FILE="$PRESET_PROMPT_FILE"
+
+  load_config_file "$CONFIG_FILE"
+
+  [ "$CLI_WORKDIR" = "$PRESET_WORKDIR" ] || WORKDIR="$CLI_WORKDIR"
+  [ "$CLI_YOUTUBE_URL" = "$PRESET_YOUTUBE_URL" ] || YOUTUBE_URL="$CLI_YOUTUBE_URL"
+  [ "$CLI_VIDEO_BASENAME" = "$PRESET_VIDEO_BASENAME" ] || VIDEO_BASENAME="$CLI_VIDEO_BASENAME"
+  [ "$CLI_LESSON_TOPIC" = "$PRESET_LESSON_TOPIC" ] || LESSON_TOPIC="$CLI_LESSON_TOPIC"
+  [ "$CLI_TERMINOLOGY_CONTEXT" = "$PRESET_TERMINOLOGY_CONTEXT" ] || TERMINOLOGY_CONTEXT="$CLI_TERMINOLOGY_CONTEXT"
+  [ "$CLI_TERMINOLOGY_FILE" = "$PRESET_TERMINOLOGY_FILE" ] || TERMINOLOGY_FILE="$CLI_TERMINOLOGY_FILE"
+  [ "$CLI_ROI_MODE" = "$PRESET_ROI_MODE" ] || ROI_MODE="$CLI_ROI_MODE"
+  [ "$CLI_CHUNK_SIZE" = "$PRESET_CHUNK_SIZE" ] || CHUNK_SIZE="$CLI_CHUNK_SIZE"
+  [ "$CLI_SUB_LANGS" = "$PRESET_SUB_LANGS" ] || SUB_LANGS="$CLI_SUB_LANGS"
+  [ "$CLI_YTDLP_MODE" = "$PRESET_YTDLP_MODE" ] || YTDLP_MODE="$CLI_YTDLP_MODE"
+  [ "$CLI_COOKIES_FROM_BROWSER" = "$PRESET_COOKIES_FROM_BROWSER" ] || COOKIES_FROM_BROWSER="$CLI_COOKIES_FROM_BROWSER"
+  [ "$CLI_MODEL" = "$PRESET_MODEL" ] || MODEL="$CLI_MODEL"
+  [ "$CLI_TEMPERATURE" = "$PRESET_TEMPERATURE" ] || TEMPERATURE="$CLI_TEMPERATURE"
+  [ "$CLI_MAX_OUTPUT_TOKENS" = "$PRESET_MAX_OUTPUT_TOKENS" ] || MAX_OUTPUT_TOKENS="$CLI_MAX_OUTPUT_TOKENS"
+  [ "$CLI_EFFORT" = "$PRESET_EFFORT" ] || EFFORT="$CLI_EFFORT"
+  [ "$CLI_VERBOSITY" = "$PRESET_VERBOSITY" ] || VERBOSITY="$CLI_VERBOSITY"
+  [ "$CLI_PROMPT_FILE" = "$PRESET_PROMPT_FILE" ] || PROMPT_FILE="$CLI_PROMPT_FILE"
+
+  [ "$CLI_KEEP_INTERMEDIATE_SRTS" -eq 0 ] || KEEP_INTERMEDIATE_SRTS=1
+  [ "$CLI_KEEP_RAW_JSON" -eq 0 ] || KEEP_RAW_JSON=1
+  [ "$CLI_KEEP_TEMP" -eq 0 ] || KEEP_TEMP=1
+  [ "$CLI_SKIP_DOWNLOAD" -eq 0 ] || SKIP_DOWNLOAD=1
+  [ "$CLI_SKIP_SUBS" -eq 0 ] || SKIP_SUBS=1
+  [ "$CLI_SKIP_SCREENSHOTS" -eq 0 ] || SKIP_SCREENSHOTS=1
+  [ "$CLI_SKIP_LLM" -eq 0 ] || SKIP_LLM=1
+  [ "$CLI_SKIP_PDF" -eq 0 ] || SKIP_PDF=1
+  [ -z "$CLI_FROM_STEP" ] || FROM_STEP="$CLI_FROM_STEP"
+  [ "$CLI_FORCE_ALL" -eq 0 ] || FORCE_ALL=1
+  [ "$CLI_NON_INTERACTIVE" -eq 0 ] || NON_INTERACTIVE=1
+  [ "$CLI_DRY_RUN" -eq 0 ] || DRY_RUN=1
 fi
 
-move_final_outputs_to_workdir
+apply_verbosity_mode
+normalize_and_validate_args
+check_dependencies
+resolve_inputs
+setup_paths
+
+if [ -n "$YOUTUBE_URL" ] && { [ "$SKIP_DOWNLOAD" -eq 0 ] || [ "$SKIP_SUBS" -eq 0 ]; }; then
+  validate_youtube_url "$YOUTUBE_URL"
+  log "URL verificato"
+fi
+
+compute_checkpoints
+ensure_prerequisites_for_skips
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  print_resolved_config
+  print_execution_plan
+  exit 0
+fi
+
+log "Cartella di lavoro: $WORKDIR"
+[ -n "$COOKIES_FROM_BROWSER" ] && log "Cookies browser abilitati per yt-dlp: $COOKIES_FROM_BROWSER"
+log "Modalità ytdlp: $YTDLP_MODE"
+log "Verbosity: $VERBOSITY"
+
+step_download_video
+step_download_subs
+task_screenshots
+
+require_dir "$SLIDES_DIR"
+require_file "${SLIDES_DIR}/slides.csv"
+
+run_llm_pipeline
+
+if [ "$SKIP_LLM" -eq 0 ]; then
+  require_file "$MERGED_SLIDE_TEXTS_JSON"
+fi
+
+step_generate_pdf
 cleanup_intermediate_srts
+cleanup_temp_files
 
 log "Pipeline completata."
 
 echo
 echo "Output principali:"
-echo " - Video: $VIDEO_PATH"
-echo " - SRT originale: $ORIGINAL_SRT"
-echo " - Cartella slide: $SLIDES_DIR"
-echo " - Chunk LLM: $LLM_CHUNKS_DIR"
-echo " - Chunk corretti: $LLM_CORRECTED_DIR"
-echo " - JSON finale slide texts: $MERGED_SLIDE_TEXTS_JSON"
-echo " - PDF: $FINAL_PDF"
-echo " - DOCX: $FINAL_DOCX"
+[ -f "$VIDEO_PATH" ] && echo " - Video: $VIDEO_PATH"
+[ -f "$ORIGINAL_SRT" ] && echo " - SRT originale: $ORIGINAL_SRT"
+[ -d "$SLIDES_DIR" ] && echo " - Cartella slide: $SLIDES_DIR"
+[ -d "$LLM_CHUNKS_DIR" ] && echo " - Chunk LLM: $LLM_CHUNKS_DIR"
+[ -d "$LLM_CORRECTED_DIR" ] && echo " - Chunk corretti: $LLM_CORRECTED_DIR"
+[ -f "$MERGED_SLIDE_TEXTS_JSON" ] && echo " - JSON finale slide texts: $MERGED_SLIDE_TEXTS_JSON"
+[ -f "$FINAL_PDF" ] && echo " - PDF: $FINAL_PDF"
+[ -f "$FINAL_DOCX" ] && echo " - DOCX: $FINAL_DOCX"
 echo " - Log: $LOG_DIR"
