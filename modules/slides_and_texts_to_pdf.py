@@ -281,15 +281,15 @@ def draw_slide_page(c, page_w, page_h, slide_path, text_lines, slide_num, time_r
     draw_header(c, page_w, page_h, f"Slide {slide_num}", time_range)
     draw_footer(c, page_w, page_h, page_num)
 
-    margin_x = 36
+    margin_x = 24
     top_y = page_h - 40
     bottom_y = 32
 
     usable_w = page_w - 2 * margin_x
     usable_h = top_y - bottom_y
 
-    img_area_h = usable_h * 0.56
-    gap = 14
+    img_area_h = usable_h * 0.70
+    gap = 10
 
     img_box_w = usable_w
     img_box_h = img_area_h
