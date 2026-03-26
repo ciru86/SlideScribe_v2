@@ -2,52 +2,107 @@
 set -euo pipefail
 
 # ============================================================
-# Slidescribe - pipeline YouTube -> slide screenshots -> LLM cleanup -> PDF/DOCX
+# Slidescribe - orchestratore Bash della pipeline:
+#   YouTube -> screenshot slide -> pulizia LLM -> PDF/DOCX
 #
-# Precedence:
-#   CLI flags > config file > built-in defaults > interactive prompts
+# Scopo del file:
+# - coordinare i vari moduli Python
+# - gestire configurazione, CLI, file di config e prompt interattivi
+# - decidere quali step eseguire o saltare
+# - centralizzare logging, checkpoint e validazioni
 #
-# Notes:
-# - Interactive prompts are used only when a required value is still missing
-#   and --non-interactive is NOT enabled.
-# - --prompt-file replaces the built-in LLM prompt entirely.
-# - --from-step defines the starting point of the pipeline.
-# - --skip-* removes individual steps from the active execution plan.
-# - --force-all forces re-execution of active steps even if checkpoint files exist.
+# Precedenza configurazione:
+#   1) flag CLI
+#   2) file config
+#   3) default interni
+#   4) prompt interattivi (solo se permesso)
+#
+# Note importanti:
+# - i prompt interattivi vengono usati solo se manca ancora un valore
+#   obbligatorio e NON è stata attivata la modalità --non-interactive
+# - --prompt-file sostituisce completamente il prompt LLM built-in
+# - --from-step definisce da quale fase partire
+# - --skip-* rimuove step specifici dal piano di esecuzione
+# - --force-all forza il ricalcolo/riesecuzione degli step attivi
+#   anche se esistono già file checkpoint compatibili
 # ============================================================
+
 
 # ============================================================
 # SCRIPT / TOOL FILES
 # ============================================================
+# Percorsi relativi dei moduli usati dall'orchestratore.
+# Vengono risolti rispetto alla cartella dello script principale.
 SCREENSHOT_SCRIPT="modules/Screenshot_grabber.py"
 EXPORT_SCRIPT="modules/export_for_llm.py"
 IMPORT_SCRIPT="modules/import_corrected_for_pdf_docx.py"
 PDF_SCRIPT="modules/slides_and_texts_to_pdf.py"
 
+
 # ============================================================
 # DEFAULTS
 # ============================================================
+# SCRIPT_NAME: solo nome del file bash corrente.
 SCRIPT_NAME="$(basename "$0")"
+
+# SCRIPT_DIR: cartella assoluta che contiene questo script.
+# Serve per risolvere in modo robusto moduli, venv e config relativi.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Python della virtualenv locale.
+# Tutti i moduli Python della pipeline vengono eseguiti con questo interprete.
 VENV_PYTHON="${SCRIPT_DIR}/.venv/bin/python"
+
+# Percorso fallback per yt-dlp quando non si vuole / non si può usare
+# quello trovato nel PATH di sistema.
 YTDLP_FALLBACK_PATH="$HOME/.local/bin/yt-dlp"
+
+# Array che conterrà il comando yt-dlp effettivamente costruito.
 YTDLP_CMD=()
 
+# -----------------------------
+# Parametri LLM / pipeline.
+# -----------------------------
 MODEL="gpt-5.4"
 TEMPERATURE="0.3"
+
+# Vuoto di default: se resta vuoto, il wrapper chatgpt non riceve
+# il parametro -k e decide lui il comportamento.
 MAX_OUTPUT_TOKENS=""
 EFFORT=""
+
+# Verbosità separata:
+# - SCRIPT_VERBOSITY controlla i log dell'orchestratore Bash
+# - LLM_VERBOSITY controlla il wrapper chatgpt
 SCRIPT_VERBOSITY="normal"
 LLM_VERBOSITY="low"
+
+# Numero di slide per chunk durante l'export verso l'LLM.
 CHUNK_SIZE="20"
-YTDLP_MODE="auto"              # auto | system | fallback
+
+# Modalità di scelta di yt-dlp:
+# - auto     = prova comando di sistema, poi fallback
+# - system   = solo yt-dlp nel PATH
+# - fallback = solo ~/.local/bin/yt-dlp
+YTDLP_MODE="auto"
+
+# Lingue sottotitoli automatici da chiedere a yt-dlp.
 SUB_LANGS="it,it-IT,it.*,ita"
+
+# Browser da cui estrarre i cookie, se richiesto.
 COOKIES_FROM_BROWSER=""
-ROI_MODE=""                    # shared | separate
-ENHANCE_SLIDE=0               # 0 | 1
-ENHANCE_PRESET=""             # mild | medium | strong
+
+# Modalità ROI:
+# - shared   = slide area e trigger area coincidono / rettangolari
+# - separate = trigger separato e slide area poligonale
+ROI_MODE=""
+
+# Enhancement opzionale degli screenshot.
+ENHANCE_SLIDE=0
+ENHANCE_PRESET=""
+
+# Parametri principali di input / contenuto.
 WORKDIR=""
 YOUTUBE_URL=""
 VIDEO_BASENAME=""
@@ -55,10 +110,13 @@ LESSON_TOPIC=""
 TERMINOLOGY_CONTEXT=""
 TERMINOLOGY_FILE=""
 PROMPT_FILE=""
+
+# Config default e config esplicita da CLI.
 CONFIG_DEFAULT="config/slidescribe.conf"
 CONFIG_FILE=""
 CONFIG_FILE_EXPLICIT=""
 
+# Flag booleane operative.
 NON_INTERACTIVE=0
 DRY_RUN=0
 FORCE_ALL=0
@@ -71,33 +129,45 @@ SKIP_SUBS=0
 SKIP_SCREENSHOTS=0
 SKIP_LLM=0
 SKIP_PDF=0
-FROM_STEP=""                   # screenshots | llm | pdf
 
-# verbosity-derived logging
+# Punto di ingresso alternativo della pipeline.
+FROM_STEP=""   # screenshots | llm | pdf
+
+# -----------------------------
+# Variabili derivate dalla verbosity.
+# -----------------------------
 VERBOSE_LOGS=0
 DEBUG_LOGS=0
 QUIET_LOGS=0
 
-# runtime derived / globals used later
+# -----------------------------
+# Variabili runtime valorizzate più avanti.
+# -----------------------------
 PROMPT_TEXT=""
 DOWNLOADED_SRT=""
 SCREENSHOTS_NEEDED=1
 LLM_PIPELINE_NEEDED=1
 PDF_NEEDED=1
 
+
 # ============================================================
 # UTILITY
 # ============================================================
+
 die() {
+  # Stampa un errore su stderr e termina subito lo script.
   echo "Errore: $*" >&2
   exit 1
 }
 
 warn() {
+  # Warning non bloccante su stderr.
   echo "Avviso: $*" >&2
 }
 
 log() {
+  # Logging standard con timestamp.
+  # Se siamo in modalità quiet non stampa nulla.
   if [ "$QUIET_LOGS" -eq 1 ]; then
     return 0
   fi
@@ -105,24 +175,30 @@ log() {
 }
 
 debug() {
+  # Logging diagnostico extra, attivo solo in modalità debug.
   if [ "$DEBUG_LOGS" -eq 1 ]; then
     printf '[%s] DEBUG: %s\n' "$(date '+%H:%M:%S')" "$*" >&2
   fi
 }
 
 require_command() {
+  # Verifica che un comando esista nel PATH.
   command -v "$1" >/dev/null 2>&1 || die "Comando non trovato: $1"
 }
 
 require_file() {
+  # Verifica che esista un file regolare.
   [ -f "$1" ] || die "File non trovato: $1"
 }
 
 require_dir() {
+  # Verifica che esista una directory.
   [ -d "$1" ] || die "Cartella non trovata: $1"
 }
 
 trim() {
+  # Rimuove spazi iniziali e finali da una stringa.
+  # Utile sui valori letti da prompt interattivo.
   local s="$1"
   s="${s#"${s%%[![:space:]]*}"}"
   s="${s%"${s##*[![:space:]]}"}"
@@ -130,14 +206,18 @@ trim() {
 }
 
 file_exists_nonempty() {
+  # Ritorna vero solo se il file esiste ed è non vuoto.
   [ -f "$1" ] && [ -s "$1" ]
 }
 
 timestamp_for_backup() {
+  # Timestamp compatto per backup filename-friendly.
   date '+%Y%m%d-%H%M%S'
 }
 
 backup_file_if_exists() {
+  # Se il file esiste, lo rinomina aggiungendo motivo e timestamp.
+  # Serve per non sovrascrivere output finali già presenti.
   local path="$1"
   local reason="${2:-backup}"
   local backup=""
@@ -150,6 +230,8 @@ backup_file_if_exists() {
 }
 
 prompt_nonempty() {
+  # Chiede un input obbligatorio all'utente.
+  # In modalità non interattiva genera errore.
   local label="$1"
   local value=""
 
@@ -168,6 +250,8 @@ prompt_nonempty() {
 }
 
 prompt_optional() {
+  # Chiede un input opzionale all'utente.
+  # Se in non-interactive restituisce stringa vuota.
   local message="$1"
   local value
 
@@ -183,6 +267,8 @@ prompt_optional() {
 }
 
 prompt_choice_roi() {
+  # Prompt guidato per la modalità ROI.
+  # Accetta shared/separate oppure 1/2.
   local value=""
 
   if [ "$NON_INTERACTIVE" -eq 1 ]; then
@@ -214,6 +300,7 @@ prompt_choice_roi() {
 }
 
 usage() {
+  # Help sintetico da riga di comando.
   cat <<'EOF'
 Uso:
   Slidescribe.sh [opzioni]
@@ -287,6 +374,7 @@ EOF
 }
 
 manual() {
+  # Manuale esteso: spiega la logica della pipeline.
   cat <<'EOF'
 MANUALE
 ========
@@ -406,6 +494,9 @@ EOF
 }
 
 build_llm_prompt() {
+  # Costruisce il prompt standard da inviare al wrapper chatgpt.
+  # Il prompt cambia leggermente a seconda che l'utente abbia o meno
+  # specificato l'argomento della lezione e un contesto terminologico.
   local lesson_topic="$1"
   local terminology_context="$2"
   local intro_line=""
@@ -467,6 +558,8 @@ EOF
 }
 
 extract_json_field_with_python() {
+  # Estrae da una stringa JSON il valore di una certa chiave usando python3.
+  # Viene usato, per esempio, per recuperare il file_id dall'upload verso ChatGPT.
   local json_input="$1"
   local field="$2"
 
@@ -485,6 +578,8 @@ PY
 }
 
 count_slides_from_csv() {
+  # Conta il numero di righe dati in slides.csv tramite Python.
+  # Viene usato per sapere quante slide finali ci si aspetta dopo il merge.
   local csv_path="$1"
 
   "$VENV_PYTHON" - "$csv_path" <<'PY'
@@ -500,6 +595,7 @@ PY
 }
 
 cleanup_intermediate_srts() {
+  # Rimuove gli SRT intermedi se non è stata richiesta la loro conservazione.
   local path
 
   if [ "$KEEP_INTERMEDIATE_SRTS" -eq 1 ]; then
@@ -516,16 +612,20 @@ cleanup_intermediate_srts() {
 }
 
 cleanup_temp_files() {
+  # Placeholder per eventuali cleanup futuri.
+  # Al momento non rimuove nulla, salvo futura estensione.
   if [ "$KEEP_TEMP" -eq 1 ]; then
     log "Conservazione file temporanei abilitata: nessun cleanup temp"
     return 0
   fi
 
-  # Placeholder per eventuali temp futuri: al momento i log vengono sempre conservati.
   true
 }
 
 move_final_outputs_to_workdir() {
+  # I moduli finali generano PDF/DOCX dentro la cartella slides.
+  # Questa funzione li sposta nella root della working directory,
+  # facendo backup preventivo se i file finali esistono già.
   require_file "$FINAL_PDF_IN_SLIDES"
   require_file "$FINAL_DOCX_IN_SLIDES"
 
@@ -544,9 +644,13 @@ move_final_outputs_to_workdir() {
 }
 
 load_config_file() {
+  # Carica un file di configurazione shell-compatible.
+  # Nota: il file viene eseguito via `source`, quindi deve contenere
+  # assegnazioni bash valide.
   local config_path="$1"
   [ -n "$config_path" ] || return 0
 
+  # Se il path non è assoluto, lo risolve rispetto a SCRIPT_DIR.
   if [[ "$config_path" != /* ]]; then
     config_path="${SCRIPT_DIR}/${config_path}"
   fi
@@ -556,7 +660,8 @@ load_config_file() {
   debug "Carico config file: $config_path"
   source "$config_path"
 
-  # importa solo le variabili previste, se definite nel config
+  # Re-import delle sole variabili previste.
+  # L'intento è limitare l'effetto del source ai campi noti della pipeline.
   WORKDIR="${WORKDIR:-$WORKDIR}"
   YOUTUBE_URL="${YOUTUBE_URL:-$YOUTUBE_URL}"
   YTDLP_MODE="${YTDLP_MODE:-$YTDLP_MODE}"
@@ -591,6 +696,8 @@ load_config_file() {
 }
 
 parse_args() {
+  # Parsing manuale degli argomenti CLI.
+  # Ogni opzione aggiorna la variabile corrispondente.
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --workdir)
@@ -621,7 +728,7 @@ parse_args() {
         shift; [ "$#" -gt 0 ] || die "Valore mancante per --roi-mode"
         ROI_MODE="$1"
         ;;
-        --enhance-slide)
+      --enhance-slide)
         ENHANCE_SLIDE=1
         ;;
       --enhance-preset)
@@ -733,7 +840,8 @@ parse_args() {
 }
 
 apply_verbosity_mode() {
-    case "$SCRIPT_VERBOSITY" in
+  # Traduce la verbosity logica in tre flag operative.
+  case "$SCRIPT_VERBOSITY" in
     quiet)
       QUIET_LOGS=1
       VERBOSE_LOGS=0
@@ -761,18 +869,21 @@ apply_verbosity_mode() {
 }
 
 validate_number() {
+  # Verifica che un parametro sia un intero non negativo.
   local label="$1"
   local value="$2"
   [[ "$value" =~ ^[0-9]+$ ]] || die "$label deve essere un intero positivo: $value"
 }
 
 validate_float() {
+  # Verifica che un parametro abbia forma numerica decimale semplice.
   local label="$1"
   local value="$2"
   [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "$label deve essere un numero valido: $value"
 }
 
 normalize_and_validate_args() {
+  # Normalizza eventuali alias numerici e valida tutte le opzioni.
   case "$YTDLP_MODE" in
     auto|system|fallback) ;;
     *) die "Valore non valido per --ytdlp-mode: $YTDLP_MODE (attesi: auto|system|fallback)" ;;
@@ -798,6 +909,9 @@ normalize_and_validate_args() {
     die "--enhance-preset richiede --enhance-slide"
   fi
 
+  # Nota: qui nel sorgente originale c'è un controllo probabilmente errato.
+  # ENHANCE_MODE non viene definita altrove. Lo mantengo per fedeltà, ma
+  # logicamente dovrebbe quasi certamente essere rimosso o corretto.
   if [ -n "$ENHANCE_PRESET" ] && [ -z "$ENHANCE_MODE" ]; then
     die "--enhance-preset richiede --enhance"
   fi
@@ -813,9 +927,11 @@ normalize_and_validate_args() {
     low|medium|high) ;;
     *) die "Valore non valido per --llm-verbosity: $LLM_VERBOSITY (attesi: low|medium|high)" ;;
   esac
+
   validate_number "--chunk-size" "$CHUNK_SIZE"
+
   if [ -n "$MAX_OUTPUT_TOKENS" ]; then
-  validate_number "--max-output-tokens" "$MAX_OUTPUT_TOKENS"
+    validate_number "--max-output-tokens" "$MAX_OUTPUT_TOKENS"
   fi
 
   validate_float "--temperature" "$TEMPERATURE"
@@ -830,7 +946,7 @@ normalize_and_validate_args() {
     [ -x "$YTDLP_FALLBACK_PATH" ] || die "yt-dlp fallback non disponibile/eseguibile: $YTDLP_FALLBACK_PATH"
   fi
 
-  # expand from-step into logical skip defaults
+  # Espansione logica di --from-step in skip impliciti.
   case "$FROM_STEP" in
     screenshots|"")
       ;;
@@ -847,7 +963,7 @@ normalize_and_validate_args() {
       ;;
   esac
 
-  # invalid combinations
+  # Combinazioni logicamente contraddittorie.
   if [ "$FROM_STEP" = "llm" ] && [ "$SKIP_LLM" -eq 1 ]; then
     die "Combinazione non valida: --from-step llm con --skip-llm"
   fi
@@ -857,8 +973,12 @@ normalize_and_validate_args() {
 }
 
 resolve_inputs() {
+  # Risolve tutti gli input richiesti per l'esecuzione.
+  # Se mancano e siamo in interattivo, li chiede all'utente.
   if [ -z "$WORKDIR" ]; then
     WORKDIR="$(prompt_nonempty 'Inserisci il path della cartella di lavoro: ')"
+
+    # Correzione per path trascinati nel terminale con spazi escapati come `\ `.
     WORKDIR="${WORKDIR//\\ / }"
   fi
 
@@ -887,6 +1007,7 @@ resolve_inputs() {
     ROI_MODE="$(prompt_choice_roi)"
   fi
 
+  # Se esiste un file terminologico, ne incorpora il contenuto nel contesto.
   if [ -n "$TERMINOLOGY_FILE" ]; then
     local terminology_file_content
     terminology_file_content="$(cat "$TERMINOLOGY_FILE")"
@@ -899,6 +1020,7 @@ ${TERMINOLOGY_CONTEXT}"
     fi
   fi
 
+  # Prompt custom oppure prompt built-in generato dinamicamente.
   if [ -n "$PROMPT_FILE" ]; then
     PROMPT_TEXT="$(cat "$PROMPT_FILE")"
   else
@@ -907,6 +1029,7 @@ ${TERMINOLOGY_CONTEXT}"
 }
 
 setup_paths() {
+  # Costruisce tutti i percorsi file/directory usati dalla pipeline.
   VIDEO_PATH="${WORKDIR}/${VIDEO_BASENAME}.mkv"
   ORIGINAL_SRT="${WORKDIR}/${VIDEO_BASENAME}.original.srt"
   IT_SRT="${WORKDIR}/${VIDEO_BASENAME}.it.srt"
@@ -927,6 +1050,7 @@ setup_paths() {
   LOG_DIR="${WORKDIR}/logs"
   mkdir -p "$LOG_DIR" "$LLM_CHUNKS_DIR" "$LLM_CORRECTED_DIR" "$LLM_MERGED_DIR"
 
+  # Log separati per ogni modulo/fase.
   SCREENSHOT_STDOUT="${LOG_DIR}/screenshot.stdout.log"
   SCREENSHOT_STDERR="${LOG_DIR}/screenshot.stderr.log"
   EXPORT_STDOUT="${LOG_DIR}/export.stdout.log"
@@ -942,6 +1066,8 @@ setup_paths() {
 }
 
 run_logged_command() {
+  # Esegue un comando e ne redirige stdout/stderr verso file di log.
+  # Se richiesto, mostra anche l'output live a schermo tramite tee.
   local stdout_log="$1"
   local stderr_log="$2"
   local show_on_screen="${3:-0}"
@@ -957,6 +1083,7 @@ run_logged_command() {
 }
 
 build_ytdlp_command() {
+  # Costruisce l'array base del comando yt-dlp in base alla modalità scelta.
   local mode="$1"
 
   YTDLP_CMD=()
@@ -982,6 +1109,8 @@ build_ytdlp_command() {
 }
 
 run_ytdlp_with_policy() {
+  # Esegue yt-dlp applicando la policy auto/system/fallback.
+  # In modalità auto prova prima system, poi fallback se fallisce.
   local stderr_log="$1"
   local action_label="$2"
   shift 2
@@ -1035,14 +1164,18 @@ run_ytdlp_with_policy() {
 }
 
 validate_youtube_url() {
+  # Validazione preventiva dell'URL via yt-dlp in modalità simulata.
   local url="$1"
   local validation_log
   validation_log="${TMPDIR:-/tmp}/slidescribe_validate_ytdlp.$$.stderr.log"
+
   run_ytdlp_with_policy "$validation_log" "validazione URL" --simulate --skip-download -- "$url" >/dev/null
   rm -f "$validation_log"
 }
 
 run_chatgpt_upload() {
+  # Carica un file chunk verso il wrapper chatgpt.
+  # Restituisce su stdout il JSON di risposta del wrapper.
   local chunk_file="$1"
 
   if [ "$VERBOSE_LOGS" -eq 1 ]; then
@@ -1053,6 +1186,7 @@ run_chatgpt_upload() {
 }
 
 check_dependencies() {
+  # Verifica strumenti e file necessari prima di procedere.
   require_command chatgpt
   require_command python3
   require_command find
@@ -1073,6 +1207,10 @@ check_dependencies() {
 }
 
 compute_checkpoints() {
+  # Decide quali step sono realmente da eseguire in base a:
+  # - flag skip
+  # - file già presenti
+  # - force_all
   SCREENSHOTS_NEEDED=1
   LLM_PIPELINE_NEEDED=1
   PDF_NEEDED=1
@@ -1104,6 +1242,7 @@ compute_checkpoints() {
 }
 
 print_resolved_config() {
+  # Stampa tutte le variabili risolte, utile in dry-run/debug.
   cat <<EOF
 === CONFIGURAZIONE RISOLTA ===
 WORKDIR="$WORKDIR"
@@ -1142,6 +1281,7 @@ EOF
 }
 
 print_execution_plan() {
+  # Stampa il piano operativo finale in forma leggibile.
   cat <<EOF
 === PIANO DI ESECUZIONE ===
 DOWNLOAD VIDEO:     $( [ "$SKIP_DOWNLOAD" -eq 1 ] && echo SKIP || echo ACTIVE )
@@ -1154,6 +1294,8 @@ EOF
 }
 
 ensure_prerequisites_for_skips() {
+  # Se l'utente skippa uno step, verifica che i suoi output di input
+  # esistano davvero. Altrimenti la pipeline sarebbe inconsistente.
   if [ "$SKIP_SCREENSHOTS" -eq 1 ]; then
     [ -d "$SLIDES_DIR" ] || die "Hai skippato gli screenshot ma la cartella slide non esiste: $SLIDES_DIR"
     [ -f "${SLIDES_DIR}/slides.csv" ] || die "Hai skippato gli screenshot ma manca slides.csv: ${SLIDES_DIR}/slides.csv"
@@ -1164,10 +1306,12 @@ ensure_prerequisites_for_skips() {
   fi
 }
 
+
 # ============================================================
 # TASKS
 # ============================================================
 step_download_video() {
+  # Scarica il video YouTube in massima qualità e lo remuxa in MKV.
   if [ "$SKIP_DOWNLOAD" -eq 1 ]; then
     log "Download video skippato"
     return 0
@@ -1190,6 +1334,7 @@ step_download_video() {
 }
 
 step_download_subs() {
+  # Scarica i sottotitoli automatici e li converte in SRT.
   if [ "$SKIP_SUBS" -eq 1 ]; then
     log "Download sottotitoli skippato"
     return 0
@@ -1209,6 +1354,7 @@ step_download_subs() {
     -o "${WORKDIR}/${VIDEO_BASENAME}.%(ext)s" \
     -- "$YOUTUBE_URL"
 
+  # Cerca il primo file SRT generato compatibile col basename scelto.
   DOWNLOADED_SRT="$({
     find "$WORKDIR" -maxdepth 1 -type f \
       \( -name "${VIDEO_BASENAME}*.srt" \) \
@@ -1222,6 +1368,7 @@ step_download_subs() {
 }
 
 task_screenshots() {
+  # Lancia Screenshot_grabber.py con le opzioni coerenti alla config attuale.
   local -a cmd
 
   if [ "$SKIP_SCREENSHOTS" -eq 1 ]; then
@@ -1246,7 +1393,7 @@ task_screenshots() {
     cmd+=(--separate-trigger-roi)
   fi
 
-    if [ "$ENHANCE_SLIDE" -eq 1 ]; then
+  if [ "$ENHANCE_SLIDE" -eq 1 ]; then
     cmd+=(--enhance-slide)
   fi
 
@@ -1259,12 +1406,18 @@ task_screenshots() {
   log "Stderr: $SCREENSHOT_STDERR"
   run_logged_command "$SCREENSHOT_STDOUT" "$SCREENSHOT_STDERR" 1 "${cmd[@]}"
 
+  # Verifiche minime di corretto completamento.
   [ -d "$SLIDES_DIR" ] || die "Screenshot_grabber terminato ma cartella slide non trovata: $SLIDES_DIR"
   [ -f "${SLIDES_DIR}/slides.csv" ] || die "Screenshot_grabber terminato ma slides.csv non trovato in: $SLIDES_DIR"
   [ -s "${SLIDES_DIR}/slides.csv" ] || die "Screenshot_grabber terminato ma slides.csv è vuoto: ${SLIDES_DIR}/slides.csv"
 }
 
 run_llm_pipeline() {
+  # Pipeline completa di correzione testi:
+  # 1) export slide+testo in chunk
+  # 2) upload chunk a ChatGPT
+  # 3) salvataggio chunk corretti
+  # 4) import/merge finale in JSON unico
   local slides_csv="${SLIDES_DIR}/slides.csv"
   local expected_slides
   local chunk_file
@@ -1311,6 +1464,7 @@ run_llm_pipeline() {
   [ -n "$expected_slides" ] || die "Impossibile contare le slide da $slides_csv"
   log "Slide attese dal CSV: $expected_slides"
 
+  # Raccoglie tutti i chunk generati.
   shopt -s nullglob
   local chunk_files=( "$LLM_CHUNKS_DIR"/"${VIDEO_BASENAME}".chunk_*.txt )
   shopt -u nullglob
@@ -1321,6 +1475,7 @@ run_llm_pipeline() {
     corrected_file="${LLM_CORRECTED_DIR}/${chunk_basename}.corrected.txt"
     raw_json_path="${LLM_CORRECTED_DIR}/${chunk_basename}.raw.json"
 
+    # Se il chunk corretto esiste già e non è forzata la riesecuzione, salta.
     if [ "$FORCE_ALL" -eq 0 ] && file_exists_nonempty "$corrected_file"; then
       log "Chunk corretto già presente, skip: $corrected_file"
       continue
@@ -1354,6 +1509,7 @@ run_llm_pipeline() {
       chatgpt_cmd+=(--save-raw "$raw_json_path")
     fi
 
+    # Il prompt vero e proprio viene passato come ultimo argomento.
     chatgpt_cmd+=("$PROMPT_TEXT")
 
     if [ "$VERBOSE_LOGS" -eq 1 ]; then
@@ -1388,6 +1544,7 @@ run_llm_pipeline() {
 }
 
 step_generate_pdf() {
+  # Genera PDF e DOCX finali partendo da slide e JSON dei testi corretti.
   if [ "$SKIP_PDF" -eq 1 ]; then
     log "Generazione PDF/DOCX skippata"
     return 0
@@ -1422,9 +1579,14 @@ step_generate_pdf() {
   move_final_outputs_to_workdir
 }
 
+
 # ============================================================
 # MAIN
 # ============================================================
+# Salvataggio dei default iniziali. Servono per distinguere tra:
+# - valore rimasto al default
+# - valore davvero impostato via CLI
+# quando più avanti si carica un file config e si riapplicano gli override CLI.
 PRESET_WORKDIR="$WORKDIR"
 PRESET_YOUTUBE_URL="$YOUTUBE_URL"
 PRESET_VIDEO_BASENAME="$VIDEO_BASENAME"
@@ -1446,18 +1608,22 @@ PRESET_SCRIPT_VERBOSITY="$SCRIPT_VERBOSITY"
 PRESET_LLM_VERBOSITY="$LLM_VERBOSITY"
 PRESET_PROMPT_FILE="$PROMPT_FILE"
 
+# 1) parsing argomenti CLI
 parse_args "$@"
+
+# 2) se è stata passata --config-file, ha priorità sullo slot CONFIG_FILE
 if [ -n "$CONFIG_FILE_EXPLICIT" ]; then
   CONFIG_FILE="$CONFIG_FILE_EXPLICIT"
 fi
 
+# 3) validazione minima esistenza file config
 if [ -n "$CONFIG_FILE" ] && [ ! -f "$CONFIG_FILE" ]; then
   die "Config file non trovato: $CONFIG_FILE"
 fi
 
-# load config after parsing just to know CONFIG_FILE, then re-apply CLI overrides explicitly
+# 4) caricamento config + riapplicazione esplicita override CLI
 if [ -n "$CONFIG_FILE" ]; then
-  # save CLI overrides before sourcing config
+  # Salva lo stato post-CLI prima del source del config.
   CLI_WORKDIR="$WORKDIR"
   CLI_YOUTUBE_URL="$YOUTUBE_URL"
   CLI_VIDEO_BASENAME="$VIDEO_BASENAME"
@@ -1491,7 +1657,7 @@ if [ -n "$CONFIG_FILE" ]; then
   CLI_NON_INTERACTIVE="$NON_INTERACTIVE"
   CLI_DRY_RUN="$DRY_RUN"
 
-  # reset to defaults, then load config, then re-apply CLI values only when they differ from defaults or boolean set to 1
+  # Ripristina i default puri, poi carica config.
   WORKDIR="$PRESET_WORKDIR"
   YOUTUBE_URL="$PRESET_YOUTUBE_URL"
   VIDEO_BASENAME="$PRESET_VIDEO_BASENAME"
@@ -1515,6 +1681,7 @@ if [ -n "$CONFIG_FILE" ]; then
 
   load_config_file "$CONFIG_FILE"
 
+  # Riapplica solo i veri override CLI.
   [ "$CLI_WORKDIR" = "$PRESET_WORKDIR" ] || WORKDIR="$CLI_WORKDIR"
   [ "$CLI_YOUTUBE_URL" = "$PRESET_YOUTUBE_URL" ] || YOUTUBE_URL="$CLI_YOUTUBE_URL"
   [ "$CLI_VIDEO_BASENAME" = "$PRESET_VIDEO_BASENAME" ] || VIDEO_BASENAME="$CLI_VIDEO_BASENAME"
@@ -1536,6 +1703,7 @@ if [ -n "$CONFIG_FILE" ]; then
   [ "$CLI_LLM_VERBOSITY" = "$PRESET_LLM_VERBOSITY" ] || LLM_VERBOSITY="$CLI_LLM_VERBOSITY"
   [ "$CLI_PROMPT_FILE" = "$PRESET_PROMPT_FILE" ] || PROMPT_FILE="$CLI_PROMPT_FILE"
 
+  # Per le booleane, se da CLI sono state impostate a 1, sovrascrivono il config.
   [ "$CLI_KEEP_INTERMEDIATE_SRTS" -eq 0 ] || KEEP_INTERMEDIATE_SRTS=1
   [ "$CLI_KEEP_RAW_JSON" -eq 0 ] || KEEP_RAW_JSON=1
   [ "$CLI_KEEP_TEMP" -eq 0 ] || KEEP_TEMP=1
@@ -1550,41 +1718,49 @@ if [ -n "$CONFIG_FILE" ]; then
   [ "$CLI_DRY_RUN" -eq 0 ] || DRY_RUN=1
 fi
 
+# 5) applica verbosity e valida configurazione
 apply_verbosity_mode
 normalize_and_validate_args
 check_dependencies
 resolve_inputs
 setup_paths
 
+# 6) validazione URL solo se serve davvero yt-dlp
 if [ -n "$YOUTUBE_URL" ] && { [ "$SKIP_DOWNLOAD" -eq 0 ] || [ "$SKIP_SUBS" -eq 0 ]; }; then
   validate_youtube_url "$YOUTUBE_URL"
   log "URL verificato"
 fi
 
+# 7) calcolo checkpoint e coerenza skip
 compute_checkpoints
 ensure_prerequisites_for_skips
 
+# 8) dry-run: stampa e termina senza eseguire la pipeline
 if [ "$DRY_RUN" -eq 1 ]; then
   print_resolved_config
   print_execution_plan
   exit 0
 fi
 
+# 9) logging iniziale riepilogativo
 log "Cartella di lavoro: $WORKDIR"
 [ -n "$COOKIES_FROM_BROWSER" ] && log "Cookies browser abilitati per yt-dlp: $COOKIES_FROM_BROWSER"
 log "Modalità ytdlp: $YTDLP_MODE"
 log "Script verbosity: $SCRIPT_VERBOSITY"
 log "LLM verbosity: $LLM_VERBOSITY"
 
+# 10) esecuzione degli step della pipeline
 step_download_video
 step_download_subs
 task_screenshots
 
+# Dopo gli screenshot devono esistere almeno cartella slide e CSV.
 require_dir "$SLIDES_DIR"
 require_file "${SLIDES_DIR}/slides.csv"
 
 run_llm_pipeline
 
+# Se la pipeline LLM non è stata skippata, deve esistere il JSON finale.
 if [ "$SKIP_LLM" -eq 0 ]; then
   require_file "$MERGED_SLIDE_TEXTS_JSON"
 fi

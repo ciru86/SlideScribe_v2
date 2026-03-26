@@ -1,8 +1,31 @@
 #!/usr/bin/env python3
 
+# ============================================================
+# Screenshot_grabber_commented.py
+# ============================================================
+# Scopo:
+#   Estrarre automaticamente le slide da un video di una lezione.
+#
+# Flusso generale:
+#   1) L'utente seleziona la slide come quadrilatero (4 vertici).
+#   2) L'utente può opzionalmente selezionare una ROI trigger separata
+#      rettangolare, usata solo per rilevare il cambio slide.
+#   3) Lo script campiona il video a intervalli regolari.
+#   4) Quando la ROI trigger cambia abbastanza, prova a stabilizzare la
+#      transizione cercando un frame successivo più "stabile".
+#   5) Salva la slide raddrizzata con trasformazione prospettica.
+#   6) A fine processo deduplica eventuali quasi-duplicati e rinumera i file.
+#
+# Nota importante su macOS:
+#   cv2.selectROI() su macOS può lasciare la GUI di OpenCV in uno stato
+#   sporco (Dock con Python ancora attivo / beachball). Per questo il trigger
+#   rettangolare NON usa selectROI(), ma una UI custom basata su mouse callback.
+# ============================================================
+
 import os
 import csv
 import math
+import time
 import argparse
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -11,24 +34,39 @@ import cv2
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
 
+# ------------------------------------------------------------
+# Alias di tipo per rendere più leggibili firme e commenti.
+# ------------------------------------------------------------
 Point = Tuple[int, int]
 RectROI = Tuple[int, int, int, int]
 QuadROI = np.ndarray  # shape (4, 2), float32 ordered TL, TR, BR, BL
 
 
+# ============================================================
+# DATA STRUCTURES
+# ============================================================
+
 @dataclass
 class SlideCapture:
+    # Rappresenta una slide già salvata su disco.
+    # L'immagine tenuta in memoria è quella rettificata, utile per dedup finale.
     index: int
     time_sec: float
     filename: str
     image: np.ndarray
 
 
+# ============================================================
+# UTILITY FUNCTIONS
+# ============================================================
+
 def ensure_dir(path: str) -> None:
+    # Crea la cartella se non esiste già.
     os.makedirs(path, exist_ok=True)
 
 
 def format_timestamp(seconds: float) -> str:
+    # Formato filename-friendly: HH-MM-SS_mmm
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
@@ -40,11 +78,16 @@ def format_timestamp(seconds: float) -> str:
 
 
 def default_output_dir_from_video(video_path: str) -> str:
+    # Se l'utente non specifica -o/--output, usa "<nome video> slides"
     base = os.path.splitext(os.path.basename(video_path))[0]
     return f"{base} slides"
 
 
 def preprocess(img: np.ndarray, max_width: int = 1000) -> np.ndarray:
+    # Preprocessing leggero per il confronto immagini:
+    # - riduzione opzionale della larghezza
+    # - scala di grigi
+    # - blur gaussiano leggero per ridurre rumore/flicker
     h, w = img.shape[:2]
     if w > max_width:
         scale = max_width / w
@@ -58,10 +101,24 @@ def preprocess(img: np.ndarray, max_width: int = 1000) -> np.ndarray:
     return gray
 
 
+# ============================================================
+# IMAGE COMPARISON
+# ============================================================
+
 def compare_images(img1: np.ndarray, img2: np.ndarray) -> dict:
+    # Confronta due immagini con tre metriche complementari:
+    # - SSIM: somiglianza strutturale globale
+    # - mean_diff: differenza media per pixel
+    # - changed_ratio: percentuale di pixel che superano una soglia di differenza
+    #
+    # Usare solo SSIM spesso non basta: una slide con piccola animazione o
+    # comparsa di un box può avere SSIM ancora alta. Le altre due metriche
+    # aiutano a catturare cambiamenti localizzati ma visibili.
     a = preprocess(img1)
     b = preprocess(img2)
 
+    # Allinea le dimensioni al minimo comune, così il confronto non esplode se
+    # le immagini differiscono di pochi pixel.
     h = min(a.shape[0], b.shape[0])
     w = min(a.shape[1], b.shape[1])
     a = a[:h, :w]
@@ -87,6 +144,14 @@ def is_slide_change(
     mean_diff_threshold: float,
     changed_ratio_threshold: float,
 ) -> bool:
+    # Euristica per dire "questa non è più la slide precedente".
+    #
+    # Logica scelta:
+    #   - SSIM deve scendere sotto soglia
+    #   - inoltre almeno una tra mean_diff e changed_ratio deve superare soglia
+    #
+    # Questo evita di salvare cambiamenti minimi dovuti a rumore, compressione,
+    # puntatore laser, micro-animazioni o variazioni di luminosità.
     return (
         metrics["ssim"] < ssim_threshold
         and (
@@ -96,7 +161,12 @@ def is_slide_change(
     )
 
 
+# ============================================================
+# FILE OUTPUT
+# ============================================================
+
 def save_image(img: np.ndarray, out_dir: str, index: int, time_sec: float) -> str:
+    # Salva una slide su disco con nome indicizzato + timestamp.
     ts = format_timestamp(time_sec)
     filename = os.path.join(out_dir, f"slide_{index:03d}_{ts}.png")
     ok = cv2.imwrite(filename, img)
@@ -106,6 +176,8 @@ def save_image(img: np.ndarray, out_dir: str, index: int, time_sec: float) -> st
 
 
 def write_csv(records: List[SlideCapture], out_csv: str) -> None:
+    # Scrive il mapping slide -> timestamp -> filename.
+    # Utile per post-processing, PDF assembly o debugging.
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["slide_index", "timestamp_sec", "timestamp_hms", "filename"])
@@ -118,7 +190,13 @@ def write_csv(records: List[SlideCapture], out_csv: str) -> None:
             ])
 
 
+# ============================================================
+# ROI HANDLING
+# ============================================================
+
 def clamp_roi(frame: np.ndarray, roi: RectROI) -> Tuple[int, int, int, int]:
+    # Converte una ROI (x, y, w, h) nei limiti reali del frame.
+    # Ritorna coordinate clampate come x1, y1, x2, y2.
     h, w = frame.shape[:2]
     x, y, rw, rh = roi
     x1 = max(0, min(x, w - 1))
@@ -129,21 +207,50 @@ def clamp_roi(frame: np.ndarray, roi: RectROI) -> Tuple[int, int, int, int]:
 
 
 def crop_roi(frame: np.ndarray, roi: RectROI) -> np.ndarray:
+    # Estrae una copia della ROI dal frame.
     x1, y1, x2, y2 = clamp_roi(frame, roi)
     return frame[y1:y2, x1:x2].copy()
 
 
-def interactive_select_named_roi(video_path: str, window_title: str, prompt: str) -> RectROI:
-    cap = cv2.VideoCapture(video_path)
-    ok, frame = cap.read()
-    cap.release()
+# ============================================================
+# OPENCV UI HELPERS
+# ============================================================
 
-    if not ok or frame is None:
-        raise RuntimeError("Impossibile leggere il primo frame del video.")
+def close_cv_ui(window_title: Optional[str] = None) -> None:
+    # Chiusura robusta della GUI OpenCV su macOS.
+    #
+    # Perché è qui:
+    #   OpenCV / HighGUI su macOS a volte "chiude" la finestra visivamente ma
+    #   lascia il backend GUI mezzo attivo. Qui proviamo a:
+    #   1) scollegare callback mouse
+    #   2) distruggere la finestra specifica, se nota
+    #   3) distruggere tutte le finestre
+    #   4) dare qualche tick all'event loop
+    try:
+        if window_title is not None:
+            try:
+                cv2.setMouseCallback(window_title, lambda *args: None)
+            except cv2.error:
+                pass
+            try:
+                cv2.destroyWindow(window_title)
+            except cv2.error:
+                pass
 
+        cv2.destroyAllWindows()
+
+        for _ in range(8):
+            cv2.waitKey(1)
+            time.sleep(0.01)
+    except cv2.error:
+        pass
+
+
+def scale_frame_for_display(frame: np.ndarray, max_w: int = 1400) -> Tuple[np.ndarray, float]:
+    # Riduce il frame per visualizzazione interattiva, mantenendo il fattore di
+    # scala per poi riportare i click alle coordinate originali del video.
     display = frame.copy()
     scale = 1.0
-    max_w = 1400
     h, w = display.shape[:2]
 
     if w > max_w:
@@ -154,15 +261,129 @@ def interactive_select_named_roi(video_path: str, window_title: str, prompt: str
             interpolation=cv2.INTER_AREA,
         )
 
-    print(f"\n{prompt}\n")
-    roi = cv2.selectROI(window_title, display, fromCenter=False, showCrosshair=True)
-    cv2.destroyWindow(window_title)
-    cv2.waitKey(1)
+    return display, scale
 
-    x, y, rw, rh = roi
-    if rw == 0 or rh == 0:
+
+# ============================================================
+# INTERACTIVE RECT SELECTION
+# ============================================================
+
+def build_rect_preview(
+    display_frame: np.ndarray,
+    start_pt: Optional[Point],
+    end_pt: Optional[Point],
+    confirmed_roi: Optional[RectROI],
+) -> np.ndarray:
+    # Costruisce la preview della selezione rettangolare trigger.
+    # Se l'utente sta trascinando, mostra il rettangolo temporaneo.
+    # Se ha già rilasciato il mouse, mostra il rettangolo confermabile.
+    canvas = display_frame.copy()
+
+    instructions = [
+        "Drag: seleziona rettangolo trigger | ENTER/SPACE conferma | R reset | ESC annulla",
+        "Il rettangolo selezionato viene usato per rilevare il cambio slide",
+    ]
+    y = 28
+    for line in instructions:
+        cv2.putText(canvas, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 255, 255), 2, cv2.LINE_AA)
+        y += 28
+
+    rect_to_draw = None
+
+    if start_pt is not None and end_pt is not None:
+        x1 = min(start_pt[0], end_pt[0])
+        y1 = min(start_pt[1], end_pt[1])
+        x2 = max(start_pt[0], end_pt[0])
+        y2 = max(start_pt[1], end_pt[1])
+        rect_to_draw = (x1, y1, x2 - x1, y2 - y1)
+    elif confirmed_roi is not None:
+        rect_to_draw = confirmed_roi
+
+    if rect_to_draw is not None:
+        x, y, w, h = rect_to_draw
+        if w > 0 and h > 0:
+            cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 255, 0), 2, lineType=cv2.LINE_AA)
+            label = f"Trigger ROI: x={x}, y={y}, w={w}, h={h}"
+            cv2.putText(canvas, label, (20, y + 10 if y > 60 else 90), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+
+    return canvas
+
+
+def interactive_select_rect(video_path: str, window_title: str, prompt: str) -> RectROI:
+    # Selettore custom del trigger rettangolare.
+    # Sostituisce cv2.selectROI() per evitare glitch della GUI su macOS.
+    cap = cv2.VideoCapture(video_path)
+    ok, frame = cap.read()
+    cap.release()
+
+    if not ok or frame is None:
+        raise RuntimeError("Impossibile leggere il primo frame del video.")
+
+    display_frame, scale = scale_frame_for_display(frame)
+
+    start_pt: Optional[Point] = None
+    current_pt: Optional[Point] = None
+    confirmed_roi: Optional[RectROI] = None
+    dragging = False
+
+    def normalize_rect(p1: Point, p2: Point) -> RectROI:
+        # Rende il rettangolo indipendente dalla direzione del drag.
+        x1 = min(p1[0], p2[0])
+        y1 = min(p1[1], p2[1])
+        x2 = max(p1[0], p2[0])
+        y2 = max(p1[1], p2[1])
+        return x1, y1, x2 - x1, y2 - y1
+
+    def on_mouse(event: int, x: int, y: int, flags: int, param: object) -> None:
+        nonlocal start_pt, current_pt, confirmed_roi, dragging
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            start_pt = (x, y)
+            current_pt = (x, y)
+            confirmed_roi = None
+            dragging = True
+        elif event == cv2.EVENT_MOUSEMOVE and dragging:
+            current_pt = (x, y)
+        elif event == cv2.EVENT_LBUTTONUP and dragging:
+            current_pt = (x, y)
+            confirmed_roi = normalize_rect(start_pt, current_pt)
+            dragging = False
+
+    print(f"\n{prompt}\n")
+    print("Istruzioni: trascina per disegnare il trigger rettangolare. ENTER/SPACE conferma, R resetta, ESC annulla.")
+
+    cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(window_title, on_mouse)
+
+    try:
+        while True:
+            canvas = build_rect_preview(
+                display_frame,
+                start_pt if dragging else None,
+                current_pt if dragging else None,
+                confirmed_roi,
+            )
+            cv2.imshow(window_title, canvas)
+            key = cv2.waitKey(20) & 0xFF
+
+            if key in (13, 32):
+                if confirmed_roi is not None and confirmed_roi[2] > 0 and confirmed_roi[3] > 0:
+                    break
+            elif key in (ord('r'), ord('R')):
+                start_pt = None
+                current_pt = None
+                confirmed_roi = None
+                dragging = False
+            elif key == 27:
+                raise RuntimeError("Selezione ROI rettangolare annullata.")
+    finally:
+        close_cv_ui(window_title)
+
+    if confirmed_roi is None or confirmed_roi[2] <= 0 or confirmed_roi[3] <= 0:
         raise RuntimeError("ROI non selezionata.")
 
+    # Riporta la ROI dalla preview ridimensionata alle coordinate originali.
+    x, y, rw, rh = confirmed_roi
     x = int(round(x / scale))
     y = int(round(y / scale))
     rw = int(round(rw / scale))
@@ -171,7 +392,19 @@ def interactive_select_named_roi(video_path: str, window_title: str, prompt: str
     return x, y, rw, rh
 
 
+# ============================================================
+# QUADRILATERAL GEOMETRY & PERSPECTIVE WARP
+# ============================================================
+
 def order_quad_points(points: np.ndarray) -> QuadROI:
+    # Riordina 4 punti cliccati dall'utente nell'ordine:
+    #   top-left, top-right, bottom-right, bottom-left
+    #
+    # Strategia:
+    #   1) calcola il centro
+    #   2) ordina per angolo rispetto al centro
+    #   3) ruota la sequenza per far partire da top-left
+    #   4) forza orientamento consistente
     pts = np.asarray(points, dtype=np.float32)
     if pts.shape != (4, 2):
         raise ValueError("Servono esattamente 4 punti.")
@@ -196,10 +429,17 @@ def order_quad_points(points: np.ndarray) -> QuadROI:
 
 
 def distance(p1: np.ndarray, p2: np.ndarray) -> float:
+    # Distanza euclidea tra due punti.
     return float(np.linalg.norm(p1 - p2))
 
 
 def quad_output_size(quad: QuadROI) -> Tuple[int, int]:
+    # Determina dimensione output della slide rettificata a partire dalla
+    # geometria reale del quadrilatero selezionato.
+    #
+    # Invece di un output fisso hardcoded, usa media dei lati opposti per width
+    # e height. Così se la slide nel video è molto larga/stretta l'output resta
+    # coerente.
     tl, tr, br, bl = quad
     width = int(round((distance(tl, tr) + distance(bl, br)) / 2.0))
     height = int(round((distance(tl, bl) + distance(tr, br)) / 2.0))
@@ -209,6 +449,7 @@ def quad_output_size(quad: QuadROI) -> Tuple[int, int]:
 
 
 def clip_quad_to_frame(frame: np.ndarray, quad: QuadROI) -> QuadROI:
+    # Clamp dei vertici nei limiti del frame per evitare errori geometrici.
     h, w = frame.shape[:2]
     clipped = quad.copy().astype(np.float32)
     clipped[:, 0] = np.clip(clipped[:, 0], 0, w - 1)
@@ -217,6 +458,7 @@ def clip_quad_to_frame(frame: np.ndarray, quad: QuadROI) -> QuadROI:
 
 
 def warp_quad_to_rect(frame: np.ndarray, quad: QuadROI) -> np.ndarray:
+    # Applica trasformazione prospettica: da quadrilatero a rettangolo pulito.
     quad = clip_quad_to_frame(frame, quad)
     out_w, out_h = quad_output_size(quad)
 
@@ -232,32 +474,34 @@ def warp_quad_to_rect(frame: np.ndarray, quad: QuadROI) -> np.ndarray:
     return warped
 
 
+# ============================================================
+# OPTIONAL IMAGE ENHANCEMENT
+# ============================================================
+
 def gamma_correction(img: np.ndarray, gamma: float) -> np.ndarray:
+    # Gamma > 1: schiarisce leggermente le medie tonalità.
     if gamma <= 0:
         return img
+
     inv_gamma = 1.0 / gamma
     table = np.array([
-        ((i / 255.0) ** inv_gamma) * 255 for i in range(256)
-    ], dtype=np.uint8)
+        ((i / 255.0) ** inv_gamma) * 255 for i in np.arange(256)
+    ]).astype("uint8")
     return cv2.LUT(img, table)
 
 
 def auto_white_balance_grayworld(img: np.ndarray) -> np.ndarray:
-    """
-    Gray-world WB leggero: corregge dominanti colore senza stravolgere l'immagine.
-    """
-    img_f = img.astype(np.float32)
-    b, g, r = cv2.split(img_f)
-
+    # Bilanciamento del bianco semplice con ipotesi gray-world.
+    # Conservativo ma spesso utile su registrazioni con dominanti strane.
+    b, g, r = cv2.split(img.astype(np.float32))
     mean_b = np.mean(b)
     mean_g = np.mean(g)
     mean_r = np.mean(r)
-    mean_gray = (mean_b + mean_g + mean_r) / 3.0
+    gray = (mean_b + mean_g + mean_r) / 3.0
 
-    eps = 1e-6
-    scale_b = mean_gray / (mean_b + eps)
-    scale_g = mean_gray / (mean_g + eps)
-    scale_r = mean_gray / (mean_r + eps)
+    scale_b = gray / mean_b if mean_b > 0 else 1.0
+    scale_g = gray / mean_g if mean_g > 0 else 1.0
+    scale_r = gray / mean_r if mean_r > 0 else 1.0
 
     b *= scale_b
     g *= scale_g
@@ -269,19 +513,22 @@ def auto_white_balance_grayworld(img: np.ndarray) -> np.ndarray:
 
 
 def unsharp_mask(img: np.ndarray, sigma: float = 1.0, amount: float = 0.4) -> np.ndarray:
+    # Sharpen leggero per rendere il testo un po' più incisivo senza esagerare.
     blurred = cv2.GaussianBlur(img, (0, 0), sigma)
     sharpened = cv2.addWeighted(img, 1.0 + amount, blurred, -amount, 0)
     return np.clip(sharpened, 0, 255).astype(np.uint8)
 
 
 def enhance_slide(img: np.ndarray, preset: str = "mild") -> np.ndarray:
-    """
-    Miglioramento conservativo per slide:
-    - white balance leggero
-    - CLAHE sulla luminanza
-    - piccola gamma correction
-    - lieve sharpen finale
-    """
+    # Pipeline di enhancement volutamente prudente.
+    # Pensata per slide e testo, non per fotografia.
+    #
+    # Ordine scelto:
+    #   1) white balance
+    #   2) eventuale denoise
+    #   3) CLAHE sulla luminanza
+    #   4) gamma correction leggera
+    #   5) sharpen finale
     if preset == "off":
         return img
 
@@ -338,7 +585,13 @@ def enhance_slide(img: np.ndarray, preset: str = "mild") -> np.ndarray:
     return out
 
 
+# ============================================================
+# INTERACTIVE QUAD SELECTION
+# ============================================================
+
 def build_quad_preview(display_frame: np.ndarray, points: List[Point]) -> np.ndarray:
+    # Preview della selezione quadrilatera slide.
+    # Dopo il 4° punto mostra anche una preview rettificata in piccolo.
     canvas = display_frame.copy()
 
     instructions = [
@@ -380,6 +633,8 @@ def build_quad_preview(display_frame: np.ndarray, points: List[Point]) -> np.nda
 
 
 def interactive_select_quad(video_path: str, window_title: str, prompt: str) -> QuadROI:
+    # L'utente clicca i 4 vertici della slide in ordine libero.
+    # L'algoritmo poi li riordina automaticamente.
     cap = cv2.VideoCapture(video_path)
     ok, frame = cap.read()
     cap.release()
@@ -388,17 +643,7 @@ def interactive_select_quad(video_path: str, window_title: str, prompt: str) -> 
         raise RuntimeError("Impossibile leggere il primo frame del video.")
 
     base_frame = frame.copy()
-    display_frame = base_frame.copy()
-    scale = 1.0
-    max_w = 1400
-    h, w = display_frame.shape[:2]
-    if w > max_w:
-        scale = max_w / w
-        display_frame = cv2.resize(
-            display_frame,
-            (int(w * scale), int(h * scale)),
-            interpolation=cv2.INTER_AREA,
-        )
+    display_frame, scale = scale_frame_for_display(base_frame)
 
     points: List[Point] = []
 
@@ -413,29 +658,31 @@ def interactive_select_quad(video_path: str, window_title: str, prompt: str) -> 
     cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(window_title, on_mouse)
 
-    while True:
-        canvas = build_quad_preview(display_frame, points)
-        cv2.imshow(window_title, canvas)
-        key = cv2.waitKey(20) & 0xFF
+    try:
+        while True:
+            canvas = build_quad_preview(display_frame, points)
+            cv2.imshow(window_title, canvas)
+            key = cv2.waitKey(20) & 0xFF
 
-        if key in (13, 32):
-            if len(points) == 4:
-                break
-        elif key in (ord('r'), ord('R')):
-            points = []
-        elif key == 27:
-            cv2.destroyWindow(window_title)
-            cv2.waitKey(1)
-            raise RuntimeError("Selezione quadrilatero annullata.")
-
-    cv2.destroyWindow(window_title)
-    cv2.waitKey(1)
+            if key in (13, 32):
+                if len(points) == 4:
+                    break
+            elif key in (ord('r'), ord('R')):
+                points = []
+            elif key == 27:
+                raise RuntimeError("Selezione quadrilatero annullata.")
+    finally:
+        close_cv_ui(window_title)
 
     pts = np.array(points, dtype=np.float32)
     pts /= scale
     pts = order_quad_points(pts)
     return pts.astype(np.float32)
 
+
+# ============================================================
+# TEMPORAL STABILIZATION
+# ============================================================
 
 def maybe_extract_candidate(
     cap: cv2.VideoCapture,
@@ -448,9 +695,9 @@ def maybe_extract_candidate(
     stabilization_samples: int,
     stabilization_ssim: float,
 ) -> Optional[Tuple[np.ndarray, float]]:
-    """
-    Cerca una versione stabile della nuova slide guardando qualche sample successivo.
-    """
+    # Quando rilevi un cambio slide, il frame corrente potrebbe essere nel mezzo
+    # di una transizione o animazione. Qui cerchiamo uno dei frame successivi che
+    # somigli abbastanza al nuovo stato, per salvare una versione più stabile.
     best_candidate = None
 
     for k in range(1, stabilization_samples + 1):
@@ -470,11 +717,17 @@ def maybe_extract_candidate(
     return best_candidate
 
 
+# ============================================================
+# DEDUPLICATION & RENAMING
+# ============================================================
+
 def deduplicate_records(
     records: List[SlideCapture],
     dedup_ssim_threshold: float,
     dedup_mean_diff_threshold: float,
 ) -> List[SlideCapture]:
+    # Dedup finale tra slide consecutive già salvate.
+    # Utile per evitare doppio salvataggio di slide quasi identiche.
     if not records:
         return []
 
@@ -501,6 +754,7 @@ def deduplicate_records(
 
 
 def renumber_files(records: List[SlideCapture]) -> List[SlideCapture]:
+    # Dopo la dedup, rinumera le slide così non restano buchi negli indici.
     updated = []
 
     for new_idx, rec in enumerate(records, start=1):
@@ -527,6 +781,10 @@ def renumber_files(records: List[SlideCapture]) -> List[SlideCapture]:
     return updated
 
 
+# ============================================================
+# MAIN EXTRACTION PIPELINE
+# ============================================================
+
 def extract_slides(
     video_path: str,
     output_dir: Optional[str],
@@ -545,6 +803,8 @@ def extract_slides(
     enhance_slides: bool,
     enhance_preset: str,
 ) -> None:
+    # Funzione principale: orchestra selezione interattiva, scansione video,
+    # salvataggio slide, dedup e scrittura CSV.
     if output_dir is None:
         output_dir = default_output_dir_from_video(video_path)
 
@@ -566,6 +826,7 @@ def extract_slides(
     print(f"Durata stimata: {duration_sec:.1f} s")
     print(f"Output directory: {output_dir}")
 
+    # 1) Selezione area slide come quadrilatero.
     slide_quad = interactive_select_quad(
         video_path,
         "Seleziona slide (4 vertici)",
@@ -575,8 +836,9 @@ def extract_slides(
     for i, (x, y) in enumerate(slide_quad, start=1):
         print(f"  P{i}: x={x:.1f}, y={y:.1f}")
 
+    # 2) Scelta area trigger: separata oppure bounding box della slide.
     if use_separate_trigger_roi:
-        trigger_roi = interactive_select_named_roi(
+        trigger_roi = interactive_select_rect(
             video_path,
             "Seleziona area trigger",
             "Seleziona l'area rettangolare da usare per rilevare il cambio slide, poi premi INVIO o SPAZIO."
@@ -592,12 +854,16 @@ def extract_slides(
         print("Trigger ROI non separata: uso il bounding box rettangolare della quadrilatera slide.")
 
     print(f"ROI trigger: x={trigger_roi[0]}, y={trigger_roi[1]}, w={trigger_roi[2]}, h={trigger_roi[3]}")
+    close_cv_ui()
 
+    # step_frames: ogni quanti frame fare sampling.
+    # min_gap_samples: quanti sample minimi devono passare tra due slide salvate.
     step_frames = max(1, int(round(sample_every_sec * fps)))
     min_gap_samples = max(1, int(math.ceil(min_slide_duration_sec / sample_every_sec)))
 
     records: List[SlideCapture] = []
 
+    # prev_saved_roi = baseline della ROI trigger dell'ultima slide salvata.
     prev_saved_roi = None
     last_saved_sample_idx = -10_000
     slide_index = 1
@@ -620,6 +886,7 @@ def extract_slides(
         else:
             current_warped_slide_to_save = current_warped_slide
 
+        # Prima iterazione: salva eventualmente subito la prima slide e inizializza baseline.
         if prev_saved_roi is None:
             if save_first_slide:
                 img_to_save = current_warped_slide_to_save if save_mode == "crop" else frame
@@ -634,6 +901,9 @@ def extract_slides(
             metrics = compare_images(prev_saved_roi, current_trigger_roi)
             enough_time_passed = (sample_idx - last_saved_sample_idx) >= min_gap_samples
 
+            # Cambio slide rilevato solo se:
+            # - è passato abbastanza tempo dalla precedente
+            # - le metriche superano le soglie
             if enough_time_passed and is_slide_change(
                 metrics,
                 ssim_threshold=ssim_threshold,
@@ -652,6 +922,8 @@ def extract_slides(
                     stabilization_ssim=stabilization_ssim,
                 )
 
+                # Salva solo se trovi un candidato stabile. Questo riduce
+                # falsi positivi durante animazioni, transizioni o micro-flicker.
                 if candidate is not None:
                     stable_frame, stable_time = candidate
                     stable_warped_slide = warp_quad_to_rect(stable_frame, slide_quad)
@@ -698,7 +970,12 @@ def extract_slides(
     print(f"CSV: {csv_path}")
 
 
+# ============================================================
+# CLI
+# ============================================================
+
 def build_parser() -> argparse.ArgumentParser:
+    # Parser CLI con tutti i parametri principali della pipeline.
     parser = argparse.ArgumentParser(
         description="Estrae le slide da un video quando cambia il contenuto dell'area trigger; la slide viene selezionata come quadrilatero e raddrizzata prima del salvataggio."
     )
@@ -793,6 +1070,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     return parser
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 def main() -> None:
     parser = build_parser()
