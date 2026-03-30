@@ -1,3 +1,5 @@
+**Prima di lanciare SlideScribe crea la venv copiando nella root dello script i file create_venv.sh e requirements.txt nella cartella "tools".**
+
 1. # Slidescribe
 
    Pipeline Bash per trasformare un video YouTube di una lezione in un output finale composto da slide, testo corretto tramite LLM e documenti finali consultabili.
