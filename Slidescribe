@@ -65,13 +65,6 @@ SCRIPT_PATH="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)/$(basename "$SOURCE_PAT
 SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
 cd "$SCRIPT_DIR"
 
-if [ -f "$HOME/.secrets" ]; then
-  # shellcheck disable=SC1090
-  source "$HOME/.secrets"
-fi
-
-[ -n "${OPENAI_API_KEY:-}" ] || die "OPENAI_API_KEY non impostata"
-
 # Python della virtualenv locale.
 VENV_PYTHON="${SCRIPT_DIR}/.venv/bin/python"
 
@@ -105,6 +98,8 @@ LLM_VERBOSITY="low"
 
 # Numero di slide per chunk durante l'export verso l'LLM.
 CHUNK_SIZE="20"
+SKIP_FIRST_SEC="0"
+SKIP_LAST_SEC="0"
 
 # Modalità di scelta di yt-dlp:
 # - auto     = prova comando di sistema, poi fallback
@@ -171,7 +166,6 @@ QUIET_LOGS=0
 # -----------------------------
 PROMPT_TEXT=""
 DOWNLOADED_SRT=""
-AUTO_METADATA_ENABLED=1
 SCREENSHOTS_NEEDED=1
 LLM_PIPELINE_NEEDED=1
 PDF_NEEDED=1
@@ -185,6 +179,15 @@ die() {
   # Stampa un errore su stderr e termina subito lo script.
   echo "Errore: $*" >&2
   exit 1
+}
+
+require_openai_api_key() {
+  if [ -f "$HOME/.secrets" ]; then
+    # shellcheck source=/dev/null
+    source "$HOME/.secrets"
+  fi
+
+  [ -n "${OPENAI_API_KEY:-}" ] || die "OPENAI_API_KEY non impostata"
 }
 
 warn() {
@@ -344,6 +347,8 @@ Opzioni principali:
   --enhance-slide                Abilita enhancement screenshot
   --enhance-preset PRESET        mild | medium | strong
   --chunk-size N                 Numero slide per chunk LLM
+  --skip-first-sec N             Salta i primi N secondi del video
+  --skip-last-sec N              Esclude gli ultimi N secondi del video
   --sub-langs LIST               Lingue sottotitoli per yt-dlp
   --ytdlp-mode MODE              auto | system | fallback
   --cookies-from-browser NAME    Passa --cookies-from-browser a yt-dlp
@@ -715,6 +720,7 @@ load_config_file() {
   [ -f "$config_path" ] || die "Config file non trovato: $config_path"
 
   debug "Carico config file: $config_path"
+  # shellcheck source=/dev/null
   source "$config_path"
 
   # Re-import delle sole variabili previste.
@@ -731,6 +737,8 @@ load_config_file() {
   ENHANCE_SLIDE
   ENHANCE_PRESET
   CHUNK_SIZE="${CHUNK_SIZE:-$CHUNK_SIZE}"
+  SKIP_FIRST_SEC="${SKIP_FIRST_SEC:-$SKIP_FIRST_SEC}"
+  SKIP_LAST_SEC="${SKIP_LAST_SEC:-$SKIP_LAST_SEC}"
   MODEL="${MODEL:-$MODEL}"
   TEMPERATURE="${TEMPERATURE:-$TEMPERATURE}"
   EFFORT="${EFFORT:-$EFFORT}"
@@ -795,6 +803,14 @@ parse_args() {
       --chunk-size)
         shift; [ "$#" -gt 0 ] || die "Valore mancante per --chunk-size"
         CHUNK_SIZE="$1"
+        ;;
+      --skip-first-sec)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --skip-first-sec"
+        SKIP_FIRST_SEC="$1"
+        ;;
+      --skip-last-sec)
+        shift; [ "$#" -gt 0 ] || die "Valore mancante per --skip-last-sec"
+        SKIP_LAST_SEC="$1"
         ;;
       --sub-langs)
         shift; [ "$#" -gt 0 ] || die "Valore mancante per --sub-langs"
@@ -979,6 +995,8 @@ normalize_and_validate_args() {
   esac
 
   validate_number "--chunk-size" "$CHUNK_SIZE"
+  validate_float "--skip-first-sec" "$SKIP_FIRST_SEC"
+  validate_float "--skip-last-sec" "$SKIP_LAST_SEC"
 
   if [ -n "$MAX_OUTPUT_TOKENS" ]; then
     validate_number "--max-output-tokens" "$MAX_OUTPUT_TOKENS"
@@ -1329,6 +1347,8 @@ ROI_MODE="$ROI_MODE"
 ENHANCE_SLIDE="$ENHANCE_SLIDE"
 ENHANCE_PRESET="$ENHANCE_PRESET"
 CHUNK_SIZE="$CHUNK_SIZE"
+SKIP_FIRST_SEC="$SKIP_FIRST_SEC"
+SKIP_LAST_SEC="$SKIP_LAST_SEC"
 SUB_LANGS="$SUB_LANGS"
 YTDLP_MODE="$YTDLP_MODE"
 COOKIES_FROM_BROWSER="$COOKIES_FROM_BROWSER"
@@ -1471,6 +1491,14 @@ task_screenshots() {
     -o "$SLIDES_DIR"
   )
 
+  if [ "$SKIP_FIRST_SEC" != "0" ]; then
+    cmd+=(--skip-first-sec "$SKIP_FIRST_SEC")
+  fi
+
+  if [ "$SKIP_LAST_SEC" != "0" ]; then
+    cmd+=(--skip-last-sec "$SKIP_LAST_SEC")
+  fi
+
   if [ "$ROI_MODE" = "separate" ]; then
     cmd+=(--separate-trigger-roi)
   fi
@@ -1594,36 +1622,6 @@ prepare_lesson_context_from_srt() {
   refresh_prompt_text
 }
 
-run_chatgpt_cmd_with_retry() {
-  local stderr_log="$1"
-  shift
-  local max_attempts=3
-  local attempt=1
-  local rc=0
-
-  while [ "$attempt" -le "$max_attempts" ]; do
-    log "Tentativo ChatGPT ${attempt}/${max_attempts}..."
-
-    set +e
-    if [ "$VERBOSE_LOGS" -eq 1 ]; then
-      "$@" 2> >(tee -a "$stderr_log" >&2)
-    else
-      "$@" 2>>"$stderr_log"
-    fi
-    rc=$?
-    set -e
-
-    if [ "$rc" -eq 0 ]; then
-      return 0
-    fi
-
-    warn "Chiamata ChatGPT fallita al tentativo ${attempt} (exit ${rc})"
-    attempt=$((attempt + 1))
-    [ "$attempt" -le "$max_attempts" ] && sleep 3
-  done
-
-  return "$rc"
-}
 
 run_llm_pipeline() {
   # Pipeline completa di correzione testi:
@@ -1654,6 +1652,7 @@ run_llm_pipeline() {
 
   require_file "$slides_csv"
   require_file "$ORIGINAL_SRT"
+  require_openai_api_key
 
   prepare_lesson_context_from_srt
   [ -n "$PROMPT_TEXT" ] || die "PROMPT_TEXT vuoto dopo la preparazione del contesto lezione"
@@ -1666,7 +1665,9 @@ run_llm_pipeline() {
       --slides-csv "$slides_csv" \
       --output-dir "$LLM_CHUNKS_DIR" \
       --base-name "$VIDEO_BASENAME" \
-      --chunk-size "$CHUNK_SIZE"
+      --chunk-size "$CHUNK_SIZE" \
+      --skip-first-sec "$SKIP_FIRST_SEC" \
+      --skip-last-sec "$SKIP_LAST_SEC"
   else
     "$VENV_PYTHON" "${SCRIPT_DIR}/${EXPORT_SCRIPT}" \
       --srt "$ORIGINAL_SRT" \
@@ -1674,6 +1675,8 @@ run_llm_pipeline() {
       --output-dir "$LLM_CHUNKS_DIR" \
       --base-name "$VIDEO_BASENAME" \
       --chunk-size "$CHUNK_SIZE" \
+      --skip-first-sec "$SKIP_FIRST_SEC" \
+      --skip-last-sec "$SKIP_LAST_SEC" \
       >"$EXPORT_STDOUT" 2>"$EXPORT_STDERR"
   fi
 
@@ -1807,6 +1810,8 @@ PRESET_ROI_MODE="$ROI_MODE"
 PRESET_ENHANCE_SLIDE="$ENHANCE_SLIDE"
 PRESET_ENHANCE_PRESET="$ENHANCE_PRESET"
 PRESET_CHUNK_SIZE="$CHUNK_SIZE"
+PRESET_SKIP_FIRST_SEC="$SKIP_FIRST_SEC"
+PRESET_SKIP_LAST_SEC="$SKIP_LAST_SEC"
 PRESET_SUB_LANGS="$SUB_LANGS"
 PRESET_YTDLP_MODE="$YTDLP_MODE"
 PRESET_COOKIES_FROM_BROWSER="$COOKIES_FROM_BROWSER"
@@ -1844,6 +1849,8 @@ if [ -n "$CONFIG_FILE" ]; then
   CLI_ENHANCE_SLIDE="$ENHANCE_SLIDE"
   CLI_ENHANCE_PRESET="$ENHANCE_PRESET"
   CLI_CHUNK_SIZE="$CHUNK_SIZE"
+  CLI_SKIP_FIRST_SEC="$SKIP_FIRST_SEC"
+  CLI_SKIP_LAST_SEC="$SKIP_LAST_SEC"
   CLI_SUB_LANGS="$SUB_LANGS"
   CLI_YTDLP_MODE="$YTDLP_MODE"
   CLI_COOKIES_FROM_BROWSER="$COOKIES_FROM_BROWSER"
@@ -1878,6 +1885,8 @@ if [ -n "$CONFIG_FILE" ]; then
   ENHANCE_SLIDE="$PRESET_ENHANCE_SLIDE"
   ENHANCE_PRESET="$PRESET_ENHANCE_PRESET"
   CHUNK_SIZE="$PRESET_CHUNK_SIZE"
+  SKIP_FIRST_SEC="$PRESET_SKIP_FIRST_SEC"
+  SKIP_LAST_SEC="$PRESET_SKIP_LAST_SEC"
   SUB_LANGS="$PRESET_SUB_LANGS"
   YTDLP_MODE="$PRESET_YTDLP_MODE"
   COOKIES_FROM_BROWSER="$PRESET_COOKIES_FROM_BROWSER"
@@ -1902,6 +1911,8 @@ if [ -n "$CONFIG_FILE" ]; then
   [ "$CLI_ENHANCE_SLIDE" = "$PRESET_ENHANCE_SLIDE" ] || ENHANCE_SLIDE="$CLI_ENHANCE_SLIDE"
   [ "$CLI_ENHANCE_PRESET" = "$PRESET_ENHANCE_PRESET" ] || ENHANCE_PRESET="$CLI_ENHANCE_PRESET"
   [ "$CLI_CHUNK_SIZE" = "$PRESET_CHUNK_SIZE" ] || CHUNK_SIZE="$CLI_CHUNK_SIZE"
+  [ "$CLI_SKIP_FIRST_SEC" = "$PRESET_SKIP_FIRST_SEC" ] || SKIP_FIRST_SEC="$CLI_SKIP_FIRST_SEC"
+  [ "$CLI_SKIP_LAST_SEC" = "$PRESET_SKIP_LAST_SEC" ] || SKIP_LAST_SEC="$CLI_SKIP_LAST_SEC"
   [ "$CLI_SUB_LANGS" = "$PRESET_SUB_LANGS" ] || SUB_LANGS="$CLI_SUB_LANGS"
   [ "$CLI_YTDLP_MODE" = "$PRESET_YTDLP_MODE" ] || YTDLP_MODE="$CLI_YTDLP_MODE"
   [ "$CLI_COOKIES_FROM_BROWSER" = "$PRESET_COOKIES_FROM_BROWSER" ] || COOKIES_FROM_BROWSER="$CLI_COOKIES_FROM_BROWSER"

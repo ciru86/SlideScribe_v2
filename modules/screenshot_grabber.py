@@ -309,15 +309,22 @@ def build_rect_preview(
     return canvas
 
 
-def interactive_select_rect(video_path: str, window_title: str, prompt: str) -> RectROI:
+def interactive_select_rect(
+    video_path: str,
+    window_title: str,
+    prompt: str,
+    preview_time_sec: float = 0.0,
+) -> RectROI:
     # Selettore custom del trigger rettangolare.
     # Sostituisce cv2.selectROI() per evitare glitch della GUI su macOS.
     cap = cv2.VideoCapture(video_path)
+    if preview_time_sec > 0:
+        cap.set(cv2.CAP_PROP_POS_MSEC, preview_time_sec * 1000.0)
     ok, frame = cap.read()
     cap.release()
 
     if not ok or frame is None:
-        raise RuntimeError("Impossibile leggere il primo frame del video.")
+        raise RuntimeError("Impossibile leggere il frame di anteprima del video.")
 
     display_frame, scale = scale_frame_for_display(frame)
 
@@ -632,15 +639,22 @@ def build_quad_preview(display_frame: np.ndarray, points: List[Point]) -> np.nda
     return canvas
 
 
-def interactive_select_quad(video_path: str, window_title: str, prompt: str) -> QuadROI:
+def interactive_select_quad(
+    video_path: str,
+    window_title: str,
+    prompt: str,
+    preview_time_sec: float = 0.0,
+) -> QuadROI:
     # L'utente clicca i 4 vertici della slide in ordine libero.
     # L'algoritmo poi li riordina automaticamente.
     cap = cv2.VideoCapture(video_path)
+    if preview_time_sec > 0:
+        cap.set(cv2.CAP_PROP_POS_MSEC, preview_time_sec * 1000.0)
     ok, frame = cap.read()
     cap.release()
 
     if not ok or frame is None:
-        raise RuntimeError("Impossibile leggere il primo frame del video.")
+        raise RuntimeError("Impossibile leggere il frame di anteprima del video.")
 
     base_frame = frame.copy()
     display_frame, scale = scale_frame_for_display(base_frame)
@@ -689,6 +703,7 @@ def maybe_extract_candidate(
     frame_idx: int,
     fps: float,
     total_frames: int,
+    end_frame_exclusive: int,
     trigger_roi: RectROI,
     compare_baseline: np.ndarray,
     step_frames: int,
@@ -701,7 +716,7 @@ def maybe_extract_candidate(
     best_candidate = None
 
     for k in range(1, stabilization_samples + 1):
-        future_idx = min(frame_idx + k * step_frames, max(total_frames - 1, 0))
+        future_idx = min(frame_idx + k * step_frames, max(min(end_frame_exclusive - 1, total_frames - 1), 0))
         cap.set(cv2.CAP_PROP_POS_FRAMES, future_idx)
         ok, future_frame = cap.read()
         if not ok or future_frame is None:
@@ -802,6 +817,8 @@ def extract_slides(
     use_separate_trigger_roi: bool,
     enhance_slides: bool,
     enhance_preset: str,
+    skip_first_sec: float,
+    skip_last_sec: float,
 ) -> None:
     # Funzione principale: orchestra selezione interattiva, scansione video,
     # salvataggio slide, dedup e scrittura CSV.
@@ -821,16 +838,38 @@ def extract_slides(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration_sec = total_frames / fps if total_frames > 0 else 0.0
 
+    if skip_first_sec < 0 or skip_last_sec < 0:
+        raise ValueError("--skip-first-sec e --skip-last-sec non possono essere negativi.")
+
+    effective_start_sec = min(skip_first_sec, duration_sec)
+    effective_end_sec = max(effective_start_sec, duration_sec - skip_last_sec)
+
+    start_frame_idx = int(round(effective_start_sec * fps))
+    end_frame_exclusive = int(round(effective_end_sec * fps))
+    start_frame_idx = max(0, min(start_frame_idx, total_frames))
+    end_frame_exclusive = max(start_frame_idx, min(end_frame_exclusive, total_frames))
+
+    effective_duration_sec = max(0.0, effective_end_sec - effective_start_sec)
+    if effective_duration_sec <= 0:
+        raise RuntimeError(
+            "Il range utile del video è vuoto: controlla --skip-first-sec e --skip-last-sec."
+        )
+
     print(f"FPS: {fps:.3f}")
     print(f"Frame totali: {total_frames}")
     print(f"Durata stimata: {duration_sec:.1f} s")
+    print(f"Skip iniziale: {skip_first_sec:.1f} s")
+    print(f"Skip finale: {skip_last_sec:.1f} s")
+    print(f"Range analizzato: {effective_start_sec:.1f}s -> {effective_end_sec:.1f}s ({effective_duration_sec:.1f} s)")
+    print(f"Frame usato per la selezione ROI/slide: {effective_start_sec:.1f}s")
     print(f"Output directory: {output_dir}")
 
     # 1) Selezione area slide come quadrilatero.
     slide_quad = interactive_select_quad(
         video_path,
         "Seleziona slide (4 vertici)",
-        "Seleziona i 4 vertici della slide da salvare. Dopo il 4° click vedrai la preview rettificata. Premi INVIO o SPAZIO per confermare."
+        "Seleziona i 4 vertici della slide da salvare. Dopo il 4° click vedrai la preview rettificata. Premi INVIO o SPAZIO per confermare.",
+        preview_time_sec=effective_start_sec,
     )
     print("Slide quad ordinato (TL, TR, BR, BL):")
     for i, (x, y) in enumerate(slide_quad, start=1):
@@ -841,7 +880,8 @@ def extract_slides(
         trigger_roi = interactive_select_rect(
             video_path,
             "Seleziona area trigger",
-            "Seleziona l'area rettangolare da usare per rilevare il cambio slide, poi premi INVIO o SPAZIO."
+            "Seleziona l'area rettangolare da usare per rilevare il cambio slide, poi premi INVIO o SPAZIO.",
+            preview_time_sec=effective_start_sec,
         )
     else:
         xs = slide_quad[:, 0]
@@ -869,9 +909,9 @@ def extract_slides(
     slide_index = 1
 
     sample_idx = 0
-    frame_idx = 0
+    frame_idx = start_frame_idx
 
-    while True:
+    while frame_idx < end_frame_exclusive:
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ok, frame = cap.read()
         if not ok or frame is None:
@@ -915,6 +955,7 @@ def extract_slides(
                     frame_idx=frame_idx,
                     fps=fps,
                     total_frames=total_frames,
+                    end_frame_exclusive=end_frame_exclusive,
                     trigger_roi=trigger_roi,
                     compare_baseline=current_trigger_roi,
                     step_frames=step_frames,
@@ -1068,6 +1109,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Preset di enhancement da usare con --enhance-slides (default: mild)"
     )
 
+    parser.add_argument(
+        "--skip-first-sec",
+        type=float,
+        default=0.0,
+        help="Salta i primi N secondi del video prima di iniziare il campionamento e il rilevamento delle slide; utile per intro, sigle o schermate iniziali (default: 0.0)"
+    )
+    parser.add_argument(
+        "--skip-last-sec",
+        type=float,
+        default=0.0,
+        help="Esclude gli ultimi N secondi del video dal campionamento e dal rilevamento delle slide; utile per outro, titoli finali o coda non rilevante (default: 0.0)"
+    )
+
     return parser
 
 
@@ -1096,6 +1150,8 @@ def main() -> None:
         use_separate_trigger_roi=args.separate_trigger_roi,
         enhance_slides=args.enhance_slides,
         enhance_preset=args.enhance_preset,
+        skip_first_sec=args.skip_first_sec,
+        skip_last_sec=args.skip_last_sec,
     )
 
 

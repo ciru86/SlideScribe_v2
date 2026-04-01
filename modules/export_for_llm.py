@@ -152,6 +152,27 @@ def parse_args() -> argparse.Namespace:
         help="Testo da mettere nelle slide senza contenuto. Default: stringa vuota.",
     )
 
+    parser.add_argument(
+        "--skip-first-sec",
+        type=float,
+        default=0.0,
+        help=(
+            "Ignora i blocchi SRT che iniziano prima di N secondi; "
+            "utile se a monte hai saltato l'intro del video. Default: 0.0."
+        ),
+    )
+
+    parser.add_argument(
+        "--skip-last-sec",
+        type=float,
+        default=0.0,
+        help=(
+            "Ignora i blocchi SRT che iniziano negli ultimi N secondi del video, "
+            "calcolati rispetto all'ultimo timestamp presente in slides.csv; "
+            "utile se a monte hai escluso l'outro. Default: 0.0."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -610,6 +631,44 @@ def clean_slide_lines(lines: List[str]) -> List[str]:
 # AGGREGAZIONE TESTO PER SLIDE
 # ============================================================
 
+
+def filter_srt_blocks_by_time_window(
+    srt_blocks: List[SRTBlock],
+    skip_first_sec: float = 0.0,
+    skip_last_sec: float = 0.0,
+    video_end_sec: Optional[float] = None,
+) -> List[SRTBlock]:
+    # Filtra i blocchi SRT in base a una finestra temporale utile.
+    #
+    # Regole:
+    # - se skip_first_sec > 0, scarta i blocchi che iniziano prima di quella soglia
+    # - se skip_last_sec > 0 e conosciamo video_end_sec, scarta i blocchi che iniziano
+    #   a partire da (video_end_sec - skip_last_sec)
+    #
+    # Nota:
+    # qui usiamo start_sec, non end_sec, per restare coerenti con la logica di mapping
+    # già usata nello script.
+    if skip_first_sec < 0:
+        raise ValueError("--skip-first-sec non può essere negativo")
+
+    if skip_last_sec < 0:
+        raise ValueError("--skip-last-sec non può essere negativo")
+
+    end_limit: Optional[float] = None
+    if video_end_sec is not None and skip_last_sec > 0:
+        end_limit = max(0.0, video_end_sec - skip_last_sec)
+
+    filtered: List[SRTBlock] = []
+    for block in srt_blocks:
+        if block.start_sec < skip_first_sec:
+            continue
+        if end_limit is not None and block.start_sec >= end_limit:
+            continue
+        filtered.append(block)
+
+    return filtered
+
+
 def aggregate_text_by_slide(
     slides: List[Slide],
     srt_blocks: List[SRTBlock],
@@ -810,10 +869,20 @@ def main() -> int:
     base_name = args.base_name
     chunk_size = args.chunk_size
     empty_placeholder = args.empty_placeholder
+    skip_first_sec = args.skip_first_sec
+    skip_last_sec = args.skip_last_sec
 
     # Validazione chunk size.
     if chunk_size <= 0:
         eprint("Errore: --chunk-size deve essere > 0")
+        return 1
+
+    if skip_first_sec < 0:
+        eprint("Errore: --skip-first-sec non può essere negativo")
+        return 1
+
+    if skip_last_sec < 0:
+        eprint("Errore: --skip-last-sec non può essere negativo")
         return 1
 
     # Verifica esistenza file input.
@@ -834,6 +903,29 @@ def main() -> int:
 
     eprint(f"[INFO] Leggo SRT: {srt_path}")
     srt_blocks = parse_srt(srt_path)
+
+    video_end_sec = max(slide.timestamp_sec for slide in slides)
+
+    if skip_first_sec > 0 or skip_last_sec > 0:
+        if skip_first_sec + skip_last_sec >= video_end_sec:
+            eprint(
+                "Errore: la somma di --skip-first-sec e --skip-last-sec "
+                "azzera o supera la durata utile stimata dal CSV slide."
+            )
+            return 1
+
+        original_count = len(srt_blocks)
+        srt_blocks = filter_srt_blocks_by_time_window(
+            srt_blocks,
+            skip_first_sec=skip_first_sec,
+            skip_last_sec=skip_last_sec,
+            video_end_sec=video_end_sec,
+        )
+        eprint(
+            f"[INFO] Filtro temporale SRT attivo: "
+            f"skip_first={skip_first_sec:.3f}s, skip_last={skip_last_sec:.3f}s"
+        )
+        eprint(f"[INFO] Blocchi SRT tenuti dopo filtro: {len(srt_blocks)}/{original_count}")
 
     eprint("[INFO] Assegno i blocchi SRT alle slide...")
     by_slide_lines = aggregate_text_by_slide(slides, srt_blocks)
