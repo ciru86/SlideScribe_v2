@@ -542,7 +542,7 @@ def build_pdf(entries, input_dir: Path, output_pdf: Path):
     page_num = 1
     page_num = draw_summary_pages(c, page_w, page_h, entries, pdf_title, page_num)
 
-    logger.info(f"Genero le pagine PDF delle slide ({len(entries)} totali)")
+    logger.info(f"Genero le pagine DOCX delle slide ({len(entries)} totali)")
 
     for entry in entries:
         slide_path = input_dir / entry["filename"]
@@ -632,6 +632,7 @@ def add_docx_summary(document: Document, entries, title: str):
     # - elenco slide con timestamp e filename
     # - page break finale
     logger.info(f"Aggiungo sommario DOCX ({len(entries)} slide)")
+
     p = document.add_paragraph()
     r = p.add_run(title)
     r.bold = True
@@ -640,13 +641,10 @@ def add_docx_summary(document: Document, entries, title: str):
     p = document.add_paragraph(f"Numero slide: {len(entries)}")
     p.runs[0].font.size = Pt(11)
 
-    logger.info(f"Aggiungo sommario DOCX ({len(entries)} slide)")
     p = document.add_paragraph()
     r = p.add_run("Indice")
     r.bold = True
     r.font.size = Pt(13)
-
-    logger.info(f"Genero le pagine PDF delle slide ({len(entries)} totali)")
 
     for entry in entries:
         p = document.add_paragraph(
@@ -665,7 +663,6 @@ def add_slide_block_docx(document: Document, slide_num: int, slide_path: Path, t
     # - immagine slide
     # - testo associato
     # - page break finale
-    logger.info(f"Aggiungo sommario DOCX ({len(entries)} slide)")
     logger.info(f"DOCX -> slide {slide_num} | immagine: {slide_path.name}")
     p = document.add_paragraph()
     r = p.add_run(f"Slide {slide_num}")

@@ -65,6 +65,16 @@ SCRIPT_PATH="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)/$(basename "$SOURCE_PAT
 SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
 cd "$SCRIPT_DIR"
 
+if [ -f "$HOME/.secrets" ]; then
+  # shellcheck disable=SC1090
+  source "$HOME/.secrets"
+fi
+
+[ -n "${OPENAI_API_KEY:-}" ] || die "OPENAI_API_KEY non impostata"
+
+# Python della virtualenv locale.
+VENV_PYTHON="${SCRIPT_DIR}/.venv/bin/python"
+
 # Python della virtualenv locale.
 # Tutti i moduli Python della pipeline vengono eseguiti con questo interprete.
 VENV_PYTHON="${SCRIPT_DIR}/.venv/bin/python"
