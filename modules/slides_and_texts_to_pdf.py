@@ -51,7 +51,18 @@ def setup_logging(verbose: bool = False):
     # - DEBUG: mostra anche dettagli più fini utili per capire dove si trova lo script
     level = logging.DEBUG if verbose else logging.INFO
 
-    handler = logging.StreamHandler(sys.stdout)
+    # In molte esecuzioni questo script passa dentro wrapper shell con tee o pipe.
+    # Usare stderr per i log rende la visualizzazione live più affidabile, mentre
+    # stdout resta libero per eventuali messaggi finali o output "funzionale".
+    if hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(line_buffering=True, write_through=True)
+        except Exception:
+            # Alcuni stream sostitutivi non supportano reconfigure: in quel caso
+            # lasciamo il comportamento di default senza interrompere lo script.
+            pass
+
+    handler = logging.StreamHandler(sys.stderr)
     handler.setLevel(level)
     handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
 
