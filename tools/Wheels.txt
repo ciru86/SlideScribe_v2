@@ -1,0 +1,1 @@
+Wheels (backup dei requirements di .venv) on TrueNAS/Software/Script/Slidescribe
