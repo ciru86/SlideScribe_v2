@@ -38,6 +38,7 @@ EXPORT_SCRIPT="modules/export_for_llm.py"
 DEDUP_SCRIPT="modules/srt_to_text_dedup.py"
 IMPORT_SCRIPT="modules/import_corrected_for_pdf_docx.py"
 PDF_SCRIPT="modules/slides_and_texts_to_pdf.py"
+WHISPER_SCRIPT="modules/whisper_to_srt.py"
 
 
 # ============================================================
@@ -143,6 +144,7 @@ FORCE_ALL=0
 DELETE_INTERMEDIATE_SRTS=0
 DELETE_RAW_JSON=0
 DELETE_TEMP=0
+WHISPER=0
 
 SKIP_DOWNLOAD=0
 SKIP_SUBS=0
@@ -349,6 +351,7 @@ Opzioni principali:
   --prompt-file FILE             Prompt custom completo al posto del built-in
   --config                       Usa il config di default: config/slidescribe.conf
   --config-file FILE             Usa un config file esplicito
+  --whisper                      Genera l'SRT dal file MKV locale usando OpenAI Whisper
 
 Controllo pipeline:
   --skip-download                Salta download video
@@ -376,7 +379,7 @@ MANUALE - Slidescribe
 1) SCOPO
    Orchestrare una pipeline che:
    - scarica un video YouTube
-   - scarica i sottotitoli automatici
+   - scarica i sottotitoli automatici oppure genera un SRT via Whisper
    - estrae screenshot delle slide
    - esporta testo+slide in chunk per LLM
    - ripulisce i chunk via wrapper chatgpt
@@ -415,22 +418,42 @@ MANUALE - Slidescribe
    - system   : usa solo yt-dlp nel PATH
    - fallback : usa solo ~/.local/bin/yt-dlp
 
-7) ROI MODE
+7) MODALITA' --WHISPER
+   Se passi --whisper:
+   - Slidescribe NON scarica i sottotitoli da YouTube
+   - usa invece WORKDIR/VIDEO_BASENAME.mkv come sorgente audio
+   - genera WORKDIR/VIDEO_BASENAME.original.srt tramite OpenAI Whisper
+   - poi continua la pipeline normalmente da quel file SRT
+
+   Prerequisiti aggiuntivi:
+   - ffmpeg e ffprobe disponibili nel PATH
+   - pacchetto Python openai installato nella .venv
+   - OPENAI_API_KEY disponibile (per esempio via ~/.secrets)
+
+   Nota:
+   - se --whisper è attivo e il file MKV non esiste, la pipeline si ferma con errore
+   - il chunking audio interno serve solo a rispettare i limiti dell'API, ma l'SRT finale
+     viene ricostruito con timestamp assoluti coerenti rispetto al video completo
+
+8) ROI MODE
    shared:
      una sola area rettangolare condivisa
    separate:
      trigger separato + area slide poligonale
 
-8) ESEMPIO MINIMO
+9) ESEMPIO MINIMO
    ./slidescribe.sh --config --workdir lezione1 --youtube-url "https://..." --video-basename lezione1
 
-9) ESEMPIO DA STEP LLM
+10) ESEMPIO CON --WHISPER
+   ./slidescribe.sh --workdir /path/lezione1 --video-basename lezione1 --whisper
+
+11) ESEMPIO DA STEP LLM
    ./slidescribe.sh --config --workdir lezione1 --video-basename lezione1 --from-step llm
 
-10) ESEMPIO SOLO PDF
+12) ESEMPIO SOLO PDF
    ./slidescribe.sh --config --workdir lezione1 --video-basename lezione1 --from-step pdf
 
-11) FILE / CARTELLE CHIAVE
+13) FILE / CARTELLE CHIAVE
    output/<workdir>/
      <basename>.mkv
      <basename>.original.srt
@@ -441,7 +464,7 @@ MANUALE - Slidescribe
      llm_merged/
      logs/
 
-12) DRY RUN
+14) DRY RUN
    Risolve configurazione, controlla coerenza, stampa il piano di esecuzione e termina.
 EOF
 }
@@ -750,6 +773,7 @@ load_config_file() {
   LLM_VERBOSITY="${LLM_VERBOSITY:-$LLM_VERBOSITY}"
   COOKIES_FROM_BROWSER="${COOKIES_FROM_BROWSER:-$COOKIES_FROM_BROWSER}"
   PROMPT_FILE="${PROMPT_FILE:-$PROMPT_FILE}"
+  WHISPER="${WHISPER:-$WHISPER}"
   DELETE_INTERMEDIATE_SRTS="${DELETE_INTERMEDIATE_SRTS:-$DELETE_INTERMEDIATE_SRTS}"
   DELETE_RAW_JSON="${DELETE_RAW_JSON:-$DELETE_RAW_JSON}"
   DELETE_TEMP="${DELETE_TEMP:-$DELETE_TEMP}"
@@ -861,6 +885,9 @@ parse_args() {
       --config-file)
         shift; [ "$#" -gt 0 ] || die "Valore mancante per --config-file"
         CONFIG_FILE_EXPLICIT="$1"
+        ;;
+      --whisper)
+        WHISPER=1
         ;;
       --delete-intermediate-srts)
         DELETE_INTERMEDIATE_SRTS=1
@@ -994,6 +1021,11 @@ normalize_and_validate_args() {
     *) die "Valore non valido per --llm-verbosity: $LLM_VERBOSITY (attesi: low|medium|high)" ;;
   esac
 
+  case "$WHISPER" in
+    0|1) ;;
+    *) die "Valore non valido per WHISPER: $WHISPER (attesi: 0|1)" ;;
+  esac
+
   validate_number "--chunk-size" "$CHUNK_SIZE"
   validate_float "--skip-first-sec" "$SKIP_FIRST_SEC"
   validate_float "--skip-last-sec" "$SKIP_LAST_SEC"
@@ -1058,7 +1090,7 @@ resolve_inputs() {
   mkdir -p "$WORKDIR"
   WORKDIR="$(cd "$WORKDIR" && pwd)"
 
-  if [ "$SKIP_DOWNLOAD" -eq 0 ] || [ "$SKIP_SUBS" -eq 0 ]; then
+  if [ "$SKIP_DOWNLOAD" -eq 0 ] || { [ "$SKIP_SUBS" -eq 0 ] && [ "$WHISPER" -eq 0 ]; }; then
     if [ -z "$YOUTUBE_URL" ]; then
       YOUTUBE_URL="$(prompt_nonempty 'Inserisci URL video YouTube: ')"
     fi
@@ -1122,6 +1154,8 @@ setup_paths() {
   PDF_STDERR="${LOG_DIR}/pdf.stderr.log"
   YTDLP_VIDEO_STDERR="${LOG_DIR}/ytdlp_video.stderr.log"
   YTDLP_SUBS_STDERR="${LOG_DIR}/ytdlp_subs.stderr.log"
+  WHISPER_STDOUT="${LOG_DIR}/whisper.stdout.log"
+  WHISPER_STDERR="${LOG_DIR}/whisper.stderr.log"
 }
 
 run_logged_command() {
@@ -1290,12 +1324,18 @@ check_dependencies() {
   require_file "${SCRIPT_DIR}/${DEDUP_SCRIPT}"
   require_file "${SCRIPT_DIR}/${IMPORT_SCRIPT}"
   require_file "${SCRIPT_DIR}/${PDF_SCRIPT}"
+  require_file "${SCRIPT_DIR}/${WHISPER_SCRIPT}"
 
   case "$YTDLP_MODE" in
     auto|system)
       require_command yt-dlp
       ;;
   esac
+
+  if [ "$WHISPER" -eq 1 ]; then
+    require_command ffmpeg
+    require_command ffprobe
+  fi
 }
 
 compute_checkpoints() {
@@ -1359,6 +1399,7 @@ EFFORT="$EFFORT"
 SCRIPT_VERBOSITY="$SCRIPT_VERBOSITY"
 LLM_VERBOSITY="$LLM_VERBOSITY"
 PROMPT_FILE="$PROMPT_FILE"
+WHISPER="$WHISPER"
 CONFIG_FILE="$CONFIG_FILE"
 DELETE_INTERMEDIATE_SRTS="$DELETE_INTERMEDIATE_SRTS"
 DELETE_RAW_JSON="$DELETE_RAW_JSON"
@@ -1379,7 +1420,7 @@ print_execution_plan() {
   cat <<EOF
 === PIANO DI ESECUZIONE ===
 DOWNLOAD VIDEO:     $( [ "$SKIP_DOWNLOAD" -eq 1 ] && echo SKIP || echo ACTIVE )
-DOWNLOAD SUBS:      $( [ "$SKIP_SUBS" -eq 1 ] && echo SKIP || echo ACTIVE )
+SRT INPUT:          $( [ "$SKIP_SUBS" -eq 1 ] && echo SKIP || { [ "$WHISPER" -eq 1 ] && echo "WHISPER ACTIVE" || echo "YTDLP SUBS ACTIVE"; } )
 SCREENSHOTS:        $( [ "$SKIP_SCREENSHOTS" -eq 1 ] && echo SKIP || echo ACTIVE )
 LLM PIPELINE:       $( [ "$SKIP_LLM" -eq 1 ] && echo SKIP || echo ACTIVE )
 PDF/DOCX:           $( [ "$SKIP_PDF" -eq 1 ] && echo SKIP || echo ACTIVE )
@@ -1436,6 +1477,7 @@ step_download_video() {
 
 step_download_subs() {
   # Scarica i sottotitoli automatici e li converte in SRT.
+  # Se --whisper è attivo, genera invece l'SRT dal file MKV locale.
   if [ "$SKIP_SUBS" -eq 1 ]; then
     log "Download sottotitoli skippato"
     return 0
@@ -1443,6 +1485,21 @@ step_download_subs() {
 
   if [ "$FORCE_ALL" -eq 0 ] && file_exists_nonempty "$ORIGINAL_SRT"; then
     log "SRT originale già presente, skip download: $ORIGINAL_SRT"
+    return 0
+  fi
+
+  if [ "$WHISPER" -eq 1 ]; then
+    require_file "$VIDEO_PATH"
+    log "Generazione SRT via Whisper..."
+    run_logged_command "$WHISPER_STDOUT" "$WHISPER_STDERR" 1 \
+      "$VENV_PYTHON" "${SCRIPT_DIR}/${WHISPER_SCRIPT}" \
+      --input-video "$VIDEO_PATH" \
+      --output-srt "$ORIGINAL_SRT" \
+      --language "it" \
+      --model "whisper-1"
+
+    require_file "$ORIGINAL_SRT"
+    log "SRT originale pronto via Whisper: $ORIGINAL_SRT"
     return 0
   fi
 
@@ -1817,6 +1874,7 @@ PRESET_EFFORT="$EFFORT"
 PRESET_SCRIPT_VERBOSITY="$SCRIPT_VERBOSITY"
 PRESET_LLM_VERBOSITY="$LLM_VERBOSITY"
 PRESET_PROMPT_FILE="$PROMPT_FILE"
+PRESET_WHISPER="$WHISPER"
 
 # 1) parsing argomenti CLI
 parse_args "$@"
@@ -1856,6 +1914,7 @@ if [ -n "$CONFIG_FILE" ]; then
   CLI_SCRIPT_VERBOSITY="$SCRIPT_VERBOSITY"
   CLI_LLM_VERBOSITY="$LLM_VERBOSITY"
   CLI_PROMPT_FILE="$PROMPT_FILE"
+  CLI_WHISPER="$WHISPER"
   CLI_DELETE_INTERMEDIATE_SRTS="$DELETE_INTERMEDIATE_SRTS"
   CLI_DELETE_RAW_JSON="$DELETE_RAW_JSON"
   CLI_DELETE_TEMP="$DELETE_TEMP"
@@ -1891,6 +1950,7 @@ if [ -n "$CONFIG_FILE" ]; then
   SCRIPT_VERBOSITY="$PRESET_SCRIPT_VERBOSITY"
   LLM_VERBOSITY="$PRESET_LLM_VERBOSITY"
   PROMPT_FILE="$PRESET_PROMPT_FILE"
+  WHISPER="$PRESET_WHISPER"
 
   load_config_file "$CONFIG_FILE"
 
@@ -1917,6 +1977,7 @@ if [ -n "$CONFIG_FILE" ]; then
   [ "$CLI_SCRIPT_VERBOSITY" = "$PRESET_SCRIPT_VERBOSITY" ] || SCRIPT_VERBOSITY="$CLI_SCRIPT_VERBOSITY"
   [ "$CLI_LLM_VERBOSITY" = "$PRESET_LLM_VERBOSITY" ] || LLM_VERBOSITY="$CLI_LLM_VERBOSITY"
   [ "$CLI_PROMPT_FILE" = "$PRESET_PROMPT_FILE" ] || PROMPT_FILE="$CLI_PROMPT_FILE"
+  [ "$CLI_WHISPER" = "$PRESET_WHISPER" ] || WHISPER="$CLI_WHISPER"
 
   # Per le booleane, se da CLI sono state impostate a 1, sovrascrivono il config.
   [ "$CLI_DELETE_INTERMEDIATE_SRTS" -eq 0 ] || DELETE_INTERMEDIATE_SRTS=1
@@ -1941,7 +2002,7 @@ setup_paths
 refresh_prompt_text
 
 # 6) validazione URL solo se serve davvero yt-dlp
-if [ -n "$YOUTUBE_URL" ] && { [ "$SKIP_DOWNLOAD" -eq 0 ] || [ "$SKIP_SUBS" -eq 0 ]; }; then
+if [ -n "$YOUTUBE_URL" ] && { [ "$SKIP_DOWNLOAD" -eq 0 ] || { [ "$SKIP_SUBS" -eq 0 ] && [ "$WHISPER" -eq 0 ]; }; }; then
   validate_youtube_url "$YOUTUBE_URL"
   log "URL verificato"
 fi
