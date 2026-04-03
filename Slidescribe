@@ -19,7 +19,7 @@ set -euo pipefail
 #
 # Note importanti:
 # - i prompt interattivi vengono usati solo se manca ancora un valore
-#   obbligatorio e NON è stata attivata la modalità --non-interactive
+#   obbligatorio non fornito da CLI/config/default
 # - --prompt-file sostituisce completamente il prompt LLM built-in
 # - --from-step definisce da quale fase partire
 # - --skip-* rimuove step specifici dal piano di esecuzione
@@ -138,12 +138,11 @@ CONFIG_FILE=""
 CONFIG_FILE_EXPLICIT=""
 
 # Flag booleane operative.
-NON_INTERACTIVE=0
 DRY_RUN=0
 FORCE_ALL=0
-KEEP_INTERMEDIATE_SRTS=0
-KEEP_RAW_JSON=0
-KEEP_TEMP=0
+DELETE_INTERMEDIATE_SRTS=0
+DELETE_RAW_JSON=0
+DELETE_TEMP=0
 
 SKIP_DOWNLOAD=0
 SKIP_SUBS=0
@@ -261,13 +260,9 @@ backup_file_if_exists() {
 
 prompt_nonempty() {
   # Chiede un input obbligatorio all'utente.
-  # In modalità non interattiva genera errore.
   local label="$1"
   local value=""
 
-  if [ "$NON_INTERACTIVE" -eq 1 ]; then
-    die "Parametro obbligatorio mancante in modalità --non-interactive: ${label}"
-  fi
 
   while true; do
     printf "%s" "$label" > /dev/tty
@@ -281,14 +276,9 @@ prompt_nonempty() {
 
 prompt_optional() {
   # Chiede un input opzionale all'utente.
-  # Se in non-interactive restituisce stringa vuota.
   local message="$1"
   local value
 
-  if [ "$NON_INTERACTIVE" -eq 1 ]; then
-    printf ''
-    return 0
-  fi
 
   printf "%s" "$message" > /dev/tty
   IFS= read -r value < /dev/tty
@@ -301,9 +291,6 @@ prompt_choice_roi() {
   # Restituisce "shared" oppure "separate".
   local value=""
 
-  if [ "$NON_INTERACTIVE" -eq 1 ]; then
-    die "ROI_MODE mancante in modalità --non-interactive"
-  fi
 
   while true; do
     cat > /dev/tty <<'EOF'
@@ -372,11 +359,10 @@ Controllo pipeline:
   --from-step STEP               screenshots | llm | pdf
   --force-all                    Riesegue anche step con checkpoint già presenti
 
-Conservazione / debug:
-  --keep-intermediate-srts       Non elimina SRT intermedi
-  --keep-raw-json                Salva raw JSON del wrapper chatgpt
-  --keep-temp                    Conserva eventuali temporanei futuri
-  --non-interactive              Non fare domande interattive
+Cleanup / debug:
+  --delete-intermediate-srts     Elimina gli SRT intermedi a fine pipeline
+  --delete-raw-json              Elimina i raw JSON del wrapper chatgpt a fine pipeline
+  --delete-temp                  Elimina eventuali temporanei gestiti dalla pipeline
   --dry-run                      Mostra config e piano senza eseguire
   --manual                       Manuale esteso
   -h, --help                     Aiuto breve
@@ -657,11 +643,11 @@ PY
 }
 
 cleanup_intermediate_srts() {
-  # Rimuove gli SRT intermedi se non è stata richiesta la loro conservazione.
+  # Rimuove gli SRT intermedi solo se richiesto esplicitamente.
   local path
 
-  if [ "$KEEP_INTERMEDIATE_SRTS" -eq 1 ]; then
-    log "Conservazione SRT intermedi abilitata: nessun cleanup SRT"
+  if [ "$DELETE_INTERMEDIATE_SRTS" -eq 0 ]; then
+    log "Cleanup SRT intermedi non richiesto: nessun cleanup SRT"
     return 0
   fi
 
@@ -673,14 +659,32 @@ cleanup_intermediate_srts() {
   done
 }
 
-cleanup_temp_files() {
-  # Placeholder per eventuali cleanup futuri.
-  # Al momento non rimuove nulla, salvo futura estensione.
-  if [ "$KEEP_TEMP" -eq 1 ]; then
-    log "Conservazione file temporanei abilitata: nessun cleanup temp"
+cleanup_raw_json_files() {
+  # Rimuove i raw JSON generati dal wrapper chatgpt solo se richiesto.
+  local path
+
+  if [ "$DELETE_RAW_JSON" -eq 0 ]; then
+    log "Cleanup raw JSON non richiesto: nessun cleanup raw JSON"
     return 0
   fi
 
+  for path in "$LESSON_CONTEXT_RAW_JSON" "$LLM_CORRECTED_DIR"/*.raw.json; do
+    if [ -f "$path" ]; then
+      rm -f "$path"
+      log "Rimosso raw JSON: $path"
+    fi
+  done
+}
+
+cleanup_temp_files() {
+  # Placeholder per eventuali cleanup futuri.
+  # Al momento non ci sono temporanei dedicati da rimuovere.
+  if [ "$DELETE_TEMP" -eq 0 ]; then
+    log "Cleanup temp non richiesto: nessun cleanup temp"
+    return 0
+  fi
+
+  log "--delete-temp impostato, ma al momento non ci sono file temporanei dedicati da eliminare"
   true
 }
 
@@ -746,9 +750,9 @@ load_config_file() {
   LLM_VERBOSITY="${LLM_VERBOSITY:-$LLM_VERBOSITY}"
   COOKIES_FROM_BROWSER="${COOKIES_FROM_BROWSER:-$COOKIES_FROM_BROWSER}"
   PROMPT_FILE="${PROMPT_FILE:-$PROMPT_FILE}"
-  KEEP_INTERMEDIATE_SRTS="${KEEP_INTERMEDIATE_SRTS:-$KEEP_INTERMEDIATE_SRTS}"
-  KEEP_RAW_JSON="${KEEP_RAW_JSON:-$KEEP_RAW_JSON}"
-  KEEP_TEMP="${KEEP_TEMP:-$KEEP_TEMP}"
+  DELETE_INTERMEDIATE_SRTS="${DELETE_INTERMEDIATE_SRTS:-$DELETE_INTERMEDIATE_SRTS}"
+  DELETE_RAW_JSON="${DELETE_RAW_JSON:-$DELETE_RAW_JSON}"
+  DELETE_TEMP="${DELETE_TEMP:-$DELETE_TEMP}"
   SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-$SKIP_DOWNLOAD}"
   SKIP_SUBS="${SKIP_SUBS:-$SKIP_SUBS}"
   SKIP_SCREENSHOTS="${SKIP_SCREENSHOTS:-$SKIP_SCREENSHOTS}"
@@ -756,7 +760,6 @@ load_config_file() {
   SKIP_PDF="${SKIP_PDF:-$SKIP_PDF}"
   FROM_STEP="${FROM_STEP:-$FROM_STEP}"
   FORCE_ALL="${FORCE_ALL:-$FORCE_ALL}"
-  NON_INTERACTIVE="${NON_INTERACTIVE:-$NON_INTERACTIVE}"
   DRY_RUN="${DRY_RUN:-$DRY_RUN}"
 }
 
@@ -859,14 +862,14 @@ parse_args() {
         shift; [ "$#" -gt 0 ] || die "Valore mancante per --config-file"
         CONFIG_FILE_EXPLICIT="$1"
         ;;
-      --keep-intermediate-srts)
-        KEEP_INTERMEDIATE_SRTS=1
+      --delete-intermediate-srts)
+        DELETE_INTERMEDIATE_SRTS=1
         ;;
-      --keep-raw-json)
-        KEEP_RAW_JSON=1
+      --delete-raw-json)
+        DELETE_RAW_JSON=1
         ;;
-      --keep-temp)
-        KEEP_TEMP=1
+      --delete-temp)
+        DELETE_TEMP=1
         ;;
       --skip-download)
         SKIP_DOWNLOAD=1
@@ -889,9 +892,6 @@ parse_args() {
         ;;
       --force-all)
         FORCE_ALL=1
-        ;;
-      --non-interactive)
-        NON_INTERACTIVE=1
         ;;
       --dry-run)
         DRY_RUN=1
@@ -1360,9 +1360,9 @@ SCRIPT_VERBOSITY="$SCRIPT_VERBOSITY"
 LLM_VERBOSITY="$LLM_VERBOSITY"
 PROMPT_FILE="$PROMPT_FILE"
 CONFIG_FILE="$CONFIG_FILE"
-KEEP_INTERMEDIATE_SRTS="$KEEP_INTERMEDIATE_SRTS"
-KEEP_RAW_JSON="$KEEP_RAW_JSON"
-KEEP_TEMP="$KEEP_TEMP"
+DELETE_INTERMEDIATE_SRTS="$DELETE_INTERMEDIATE_SRTS"
+DELETE_RAW_JSON="$DELETE_RAW_JSON"
+DELETE_TEMP="$DELETE_TEMP"
 SKIP_DOWNLOAD="$SKIP_DOWNLOAD"
 SKIP_SUBS="$SKIP_SUBS"
 SKIP_SCREENSHOTS="$SKIP_SCREENSHOTS"
@@ -1370,7 +1370,6 @@ SKIP_LLM="$SKIP_LLM"
 SKIP_PDF="$SKIP_PDF"
 FROM_STEP="$FROM_STEP"
 FORCE_ALL="$FORCE_ALL"
-NON_INTERACTIVE="$NON_INTERACTIVE"
 DRY_RUN="$DRY_RUN"
 EOF
 }
@@ -1584,9 +1583,7 @@ prepare_lesson_context_from_srt() {
       chatgpt_cmd+=(--effort "$EFFORT")
     fi
 
-    if [ "$KEEP_RAW_JSON" -eq 1 ]; then
-      chatgpt_cmd+=(--save-raw "$LESSON_CONTEXT_RAW_JSON")
-    fi
+    chatgpt_cmd+=(--save-raw "$LESSON_CONTEXT_RAW_JSON")
      
     chatgpt_cmd+=("$metadata_prompt")
 
@@ -1723,9 +1720,7 @@ run_llm_pipeline() {
       chatgpt_cmd+=(--effort "$EFFORT")
     fi
 
-    if [ "$KEEP_RAW_JSON" -eq 1 ]; then
-      chatgpt_cmd+=(--save-raw "$raw_json_path")
-    fi
+    chatgpt_cmd+=(--save-raw "$raw_json_path")
 
     chatgpt_cmd+=("$PROMPT_TEXT")
 
@@ -1861,9 +1856,9 @@ if [ -n "$CONFIG_FILE" ]; then
   CLI_SCRIPT_VERBOSITY="$SCRIPT_VERBOSITY"
   CLI_LLM_VERBOSITY="$LLM_VERBOSITY"
   CLI_PROMPT_FILE="$PROMPT_FILE"
-  CLI_KEEP_INTERMEDIATE_SRTS="$KEEP_INTERMEDIATE_SRTS"
-  CLI_KEEP_RAW_JSON="$KEEP_RAW_JSON"
-  CLI_KEEP_TEMP="$KEEP_TEMP"
+  CLI_DELETE_INTERMEDIATE_SRTS="$DELETE_INTERMEDIATE_SRTS"
+  CLI_DELETE_RAW_JSON="$DELETE_RAW_JSON"
+  CLI_DELETE_TEMP="$DELETE_TEMP"
   CLI_SKIP_DOWNLOAD="$SKIP_DOWNLOAD"
   CLI_SKIP_SUBS="$SKIP_SUBS"
   CLI_SKIP_SCREENSHOTS="$SKIP_SCREENSHOTS"
@@ -1871,7 +1866,6 @@ if [ -n "$CONFIG_FILE" ]; then
   CLI_SKIP_PDF="$SKIP_PDF"
   CLI_FROM_STEP="$FROM_STEP"
   CLI_FORCE_ALL="$FORCE_ALL"
-  CLI_NON_INTERACTIVE="$NON_INTERACTIVE"
   CLI_DRY_RUN="$DRY_RUN"
 
   # Ripristina i default puri, poi carica config.
@@ -1925,9 +1919,9 @@ if [ -n "$CONFIG_FILE" ]; then
   [ "$CLI_PROMPT_FILE" = "$PRESET_PROMPT_FILE" ] || PROMPT_FILE="$CLI_PROMPT_FILE"
 
   # Per le booleane, se da CLI sono state impostate a 1, sovrascrivono il config.
-  [ "$CLI_KEEP_INTERMEDIATE_SRTS" -eq 0 ] || KEEP_INTERMEDIATE_SRTS=1
-  [ "$CLI_KEEP_RAW_JSON" -eq 0 ] || KEEP_RAW_JSON=1
-  [ "$CLI_KEEP_TEMP" -eq 0 ] || KEEP_TEMP=1
+  [ "$CLI_DELETE_INTERMEDIATE_SRTS" -eq 0 ] || DELETE_INTERMEDIATE_SRTS=1
+  [ "$CLI_DELETE_RAW_JSON" -eq 0 ] || DELETE_RAW_JSON=1
+  [ "$CLI_DELETE_TEMP" -eq 0 ] || DELETE_TEMP=1
   [ "$CLI_SKIP_DOWNLOAD" -eq 0 ] || SKIP_DOWNLOAD=1
   [ "$CLI_SKIP_SUBS" -eq 0 ] || SKIP_SUBS=1
   [ "$CLI_SKIP_SCREENSHOTS" -eq 0 ] || SKIP_SCREENSHOTS=1
@@ -1935,7 +1929,6 @@ if [ -n "$CONFIG_FILE" ]; then
   [ "$CLI_SKIP_PDF" -eq 0 ] || SKIP_PDF=1
   [ -z "$CLI_FROM_STEP" ] || FROM_STEP="$CLI_FROM_STEP"
   [ "$CLI_FORCE_ALL" -eq 0 ] || FORCE_ALL=1
-  [ "$CLI_NON_INTERACTIVE" -eq 0 ] || NON_INTERACTIVE=1
   [ "$CLI_DRY_RUN" -eq 0 ] || DRY_RUN=1
 fi
 
@@ -1989,6 +1982,7 @@ fi
 
 step_generate_pdf
 cleanup_intermediate_srts
+cleanup_raw_json_files
 cleanup_temp_files
 
 log "Pipeline completata."
