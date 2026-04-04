@@ -12,8 +12,11 @@
 - jq deve essere installato (brew install jq)
 
 - Il fallback di yt-dlp deve essere installato con pipx (homebrew install pipx):
-	- pipx reinstall yt-dlp
-	- pipx inject yt-dlp "curl-cffi>=0.10"
+
+```bash
+	pipx reinstall yt-dlp
+	pipx inject yt-dlp "curl-cffi>=0.10"
+```
 
 - ~/.zshrc deve quindi contenere le stringhe:
 
