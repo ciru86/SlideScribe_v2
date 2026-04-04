@@ -16,6 +16,8 @@
 	- pipx inject yt-dlp "curl-cffi>=0.10"
 
 - ~/.zshrc deve quindi contenere le stringhe:
+
+```bash
 	# Homebrew
 	eval "$(/opt/homebrew/bin/brew shellenv)"
 
@@ -29,10 +31,14 @@
 
 	# Secrets
 	[ -f ~/.secrets ] && source ~/.secrets
+```
+
 
 **Tutti gli script devono essere resi eseguibili con chmod +x.**
 
 **Se vuoi usare SlideScribe.app un alias di SlideScribe deve essere posto in ~/.local/bin.**
+
+
 
 1. # Slidescribe
 
