@@ -47,9 +47,11 @@
 
    Pipeline Bash per trasformare un video YouTube o un file `.mkv` locale di una lezione in un output finale composto da slide, testo corretto tramite LLM e documenti finali consultabili.
 
-   ## Cosa produce
+   ## Cosa Fa
 
-   A partire da un video YouTube oppure da un file `.mkv` locale, lo script genera:
+   L’obiettivo dello script è automatizzare la conversione di una lezione video in un formato molto più leggibile e riutilizzabile.
+
+   A partire da un video YouTube oppure da un file `.mkv` locale, Slidescribe genera:
 
    - video locale in `.mkv`
    - sottotitoli automatici in `.srt`, oppure un `.srt` generato da Whisper a partire dal file `.mkv`
@@ -67,13 +69,7 @@
 
    **YouTube oppure MKV locale → video locale / SRT → estrazione slide → dedup SRT → inferenza automatica metadata prompt → export per LLM → correzione chunk → merge finale → summary Markdown → PDF/DOCX**
 
-   ------
-
-   ## Scopo
-
-   L’obiettivo dello script è automatizzare la conversione di una lezione video in un formato molto più leggibile e riutilizzabile.
-
-   Lo script:
+   In pratica lo script:
 
    1. scarica video e sottotitoli, oppure importa un `.mkv` locale e genera l’SRT via Whisper
    2. rileva i cambi slide e salva le immagini
