@@ -428,6 +428,43 @@ def draw_header(c, page_w, page_h, title_left, title_right=None):
     c.line(24, page_h - 26, page_w - 24, page_h - 26)
 
 
+def draw_cover_page(c, page_w, page_h, pdf_title, total_slides, source_url, page_num):
+    # Disegna una cover iniziale con titolo, numero slide e URL sorgente.
+    logger.info("Genero la cover PDF")
+    draw_footer(c, page_w, page_h, page_num)
+
+    center_x = page_w / 2
+    y = page_h - 90
+
+    c.setFont("Helvetica-Bold", 24)
+    c.drawCentredString(center_x, y, pdf_title)
+    y -= 34
+
+    c.setFont("Helvetica", 13)
+    c.drawCentredString(center_x, y, f"Numero slide: {total_slides}")
+    y -= 42
+
+    if source_url:
+        c.setFont("Helvetica-Bold", 13)
+        c.drawCentredString(center_x, y, "Sorgente video")
+        y -= 24
+
+        c.setLineWidth(1)
+        c.setStrokeColorRGB(0.30, 0.42, 0.58)
+        c.roundRect(60, y - 26, page_w - 120, 44, 8, stroke=1, fill=0)
+        c.setStrokeColorRGB(0, 0, 0)
+
+        c.setFont("Helvetica", 10)
+        url_lines = wrap_text_to_width(source_url, "Helvetica", 10, page_w - 150)
+        line_y = y
+        for line in url_lines[:2]:
+            c.drawCentredString(center_x, line_y, line)
+            line_y -= 13
+
+    c.showPage()
+    return page_num + 1
+
+
 def draw_summary_pages(c, page_w, page_h, entries, pdf_title, start_page_num):
     """
     Disegna il sommario su una o più pagine PDF.
@@ -740,7 +777,7 @@ def draw_text_continuation_page(c, page_w, page_h, text_lines, slide_num, page_n
     return consumed
 
 
-def build_pdf(entries, input_dir: Path, output_pdf: Path, summary_blocks=None):
+def build_pdf(entries, input_dir: Path, output_pdf: Path, summary_blocks=None, source_url: str = ""):
     # Costruisce l'intero PDF finale.
     #
     # Flusso:
@@ -757,7 +794,7 @@ def build_pdf(entries, input_dir: Path, output_pdf: Path, summary_blocks=None):
     pdf_title = output_pdf.stem.replace("_", " ").replace("-", " ")
 
     page_num = 1
-    page_num = draw_summary_pages(c, page_w, page_h, entries, pdf_title, page_num)
+    page_num = draw_cover_page(c, page_w, page_h, pdf_title, len(entries), source_url, page_num)
     page_num = draw_markdown_summary_pages(c, page_w, page_h, summary_blocks or [], pdf_title, page_num)
 
     logger.info(f"Genero le pagine DOCX delle slide ({len(entries)} totali)")
@@ -806,6 +843,8 @@ def build_pdf(entries, input_dir: Path, output_pdf: Path, summary_blocks=None):
             c.showPage()
             page_num += 1
             remaining = remaining[consumed2:]
+
+    page_num = draw_summary_pages(c, page_w, page_h, entries, pdf_title, page_num)
 
     c.save()
     logger.info(f"PDF salvato: {output_pdf}")
@@ -871,6 +910,38 @@ def add_docx_summary(document: Document, entries, title: str):
         p.paragraph_format.space_after = Pt(2)
         for run in p.runs:
             run.font.size = Pt(10)
+
+    document.add_page_break()
+
+
+def add_docx_cover(document: Document, title: str, total_slides: int, source_url: str):
+    # Aggiunge una cover iniziale con titolo e sorgente video.
+    logger.info("Aggiungo cover DOCX")
+
+    p = document.add_paragraph()
+    p.alignment = 1
+    r = p.add_run(title)
+    r.bold = True
+    r.font.size = Pt(20)
+
+    p = document.add_paragraph()
+    p.alignment = 1
+    r = p.add_run(f"Numero slide: {total_slides}")
+    r.font.size = Pt(12)
+
+    if source_url:
+        p = document.add_paragraph()
+        p.alignment = 1
+        r = p.add_run("Sorgente video")
+        r.bold = True
+        r.font.size = Pt(12)
+
+        p = document.add_paragraph()
+        p.alignment = 1
+        p.paragraph_format.left_indent = Inches(0.5)
+        p.paragraph_format.right_indent = Inches(0.5)
+        r = p.add_run(source_url)
+        r.font.size = Pt(10)
 
     document.add_page_break()
 
@@ -969,7 +1040,7 @@ def add_slide_block_docx(document: Document, slide_num: int, slide_path: Path, t
     document.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
 
 
-def build_docx(entries, input_dir: Path, output_docx: Path, summary_blocks=None):
+def build_docx(entries, input_dir: Path, output_docx: Path, summary_blocks=None, source_url: str = ""):
     # Costruisce il DOCX finale.
     #
     # Flusso:
@@ -983,7 +1054,7 @@ def build_docx(entries, input_dir: Path, output_docx: Path, summary_blocks=None)
     set_landscape(doc)
 
     title = output_docx.stem.replace("_", " ").replace("-", " ")
-    add_docx_summary(doc, entries, title)
+    add_docx_cover(doc, title, len(entries), source_url)
     add_docx_markdown_summary(doc, summary_blocks or [])
 
     # Larghezza massima immagine leggermente inferiore alla larghezza utile
@@ -1004,6 +1075,8 @@ def build_docx(entries, input_dir: Path, output_docx: Path, summary_blocks=None)
             text=raw_text,
             max_image_width_inches=image_width
         )
+
+    add_docx_summary(doc, entries, title)
 
     doc.save(str(output_docx))
     logger.info(f"DOCX salvato: {output_docx}")
@@ -1044,6 +1117,10 @@ def main():
         help="Path opzionale del file Markdown con il riassunto finale",
     )
     parser.add_argument(
+        "--youtube-url",
+        help="URL YouTube opzionale da mostrare nella cover iniziale",
+    )
+    parser.add_argument(
         "--output-base",
         default="slides_con_testo",
         help="Nome base output senza estensione",
@@ -1064,6 +1141,7 @@ def main():
     csv_path = input_dir / args.csv
     slide_texts_path = Path(args.slide_texts).expanduser().resolve()
     summary_path = Path(args.summary_file).expanduser().resolve() if args.summary_file else None
+    youtube_url = args.youtube_url.strip() if args.youtube_url else ""
 
     output_pdf = input_dir / f"{args.output_base}.pdf"
     output_docx = input_dir / f"{args.output_base}.docx"
@@ -1071,6 +1149,7 @@ def main():
     logger.info(f"CSV atteso: {csv_path}")
     logger.info(f"JSON testi: {slide_texts_path}")
     logger.info(f"Summary:     {summary_path if summary_path else '[assente]'}")
+    logger.info(f"YouTube URL:  {youtube_url if youtube_url else '[assente]'}")
     logger.info(f"Output PDF:  {output_pdf}")
     logger.info(f"Output DOCX: {output_docx}")
 
@@ -1104,8 +1183,8 @@ def main():
 
     # Generazione output finali.
     logger.info("Inizio generazione artefatti finali")
-    build_pdf(entries, input_dir, output_pdf, summary_blocks=summary_blocks)
-    build_docx(entries, input_dir, output_docx, summary_blocks=summary_blocks)
+    build_pdf(entries, input_dir, output_pdf, summary_blocks=summary_blocks, source_url=youtube_url)
+    build_docx(entries, input_dir, output_docx, summary_blocks=summary_blocks, source_url=youtube_url)
 
     logger.info("Elaborazione completata")
     print(f"PDF creato:  {output_pdf}")
