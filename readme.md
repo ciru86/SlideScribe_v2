@@ -51,36 +51,23 @@
 
    L’obiettivo dello script è automatizzare la conversione di una lezione video in un formato molto più leggibile e riutilizzabile.
 
-   A partire da un video YouTube oppure da un file `.mkv` locale, Slidescribe genera:
+   A partire da un video YouTube oppure da un file `.mkv` locale, Slidescribe:
 
-   - video locale in `.mkv`
-   - sottotitoli automatici in `.srt`, oppure un `.srt` generato da Whisper a partire dal file `.mkv`
-   - cartella con le slide estratte dal video
-   - testo deduplicato derivato dall’SRT, senza timestamp, usato per inferire automaticamente il contesto della lezione
-   - file con argomento lezione e terminologia tecnica inferiti automaticamente
-   - chunk testuali preparati per l’LLM
-   - chunk corretti dall’LLM
-   - JSON finale con il testo associato a ciascuna slide
-   - summary finale in Markdown generato dal JSON merged
-   - PDF finale
-   - DOCX finale
+   - scarica video e sottotitoli, oppure importa un `.mkv` locale e genera l’SRT via Whisper
+   - crea un video locale in `.mkv` e un file `.srt` di lavoro
+   - rileva i cambi slide, salva le immagini e costruisce la cartella delle slide con `slides.csv`
+   - deduplica l’SRT e crea un testo grezzo senza timestamp, utile per inferire automaticamente il contesto della lezione
+   - inferisce automaticamente argomento lezione e terminologia tecnica da usare nel prompt LLM
+   - allinea la trascrizione alle slide
+   - divide il testo in chunk gestibili dall’LLM
+   - corregge i chunk via ChatGPT
+   - ricompone il materiale in un JSON finale con il testo associato a ciascuna slide
+   - genera un summary finale in Markdown a partire dal JSON merged
+   - genera PDF e DOCX con indice + summary + slide + testo
 
    In pratica la pipeline è:
 
    **YouTube oppure MKV locale → video locale / SRT → estrazione slide → dedup SRT → inferenza automatica metadata prompt → export per LLM → correzione chunk → merge finale → summary Markdown → PDF/DOCX**
-
-   In pratica lo script:
-
-   1. scarica video e sottotitoli, oppure importa un `.mkv` locale e genera l’SRT via Whisper
-   2. rileva i cambi slide e salva le immagini
-   3. deduplica l’SRT e crea un testo grezzo senza timestamp
-   4. inferisce automaticamente argomento lezione e terminologia tecnica da usare nel prompt LLM
-   5. allinea la trascrizione alle slide
-   6. divide il testo in chunk gestibili dall’LLM
-   7. corregge i chunk via ChatGPT
-   8. ricompone il materiale in un JSON finale
-   9. genera un riassunto finale in Markdown a partire dal JSON merged
-   10. genera PDF e DOCX con indice + summary + slide + testo
 
    L’orchestratore è scritto in Bash e coordina moduli Python e tool esterni.
 
