@@ -1,4 +1,4 @@
-Sposta in questa cartella le cartelle delle lezioni che contengono i docx da aggiornare alla nuova pipeline, poi fai partire lo script con 
+Sposta in questa cartella le cartelle delle lezioni che contengono i docx da aggiornare alla nuova pipeline (aggiunta summary e indice alla fine), poi fai partire lo script con 
 
 Per tutte le sottocartelle
 ```bash

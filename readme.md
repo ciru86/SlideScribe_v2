@@ -447,6 +447,139 @@
 
    # Moduli
 
+   ## whisper_to_srt.py
+
+   Modulo incaricato di generare un file `.srt` a partire da un video locale quando la pipeline non dispone già di sottotitoli utilizzabili. È il ponte tra il file `.mkv` e il resto della parte testuale di Slidescribe: estrae l’audio, lo ottimizza per la trascrizione, lo spezza in chunk se necessario per rispettare i limiti dell’API e ricompone un unico SRT finale compatibile con il resto dei moduli.
+
+   ### Funzione del modulo
+
+   `whisper_to_srt.py` fa quattro cose principali:
+
+   1. estrae dal video una traccia audio più leggera e stabile per STT
+   2. stima se il file audio può essere caricato in un solo colpo oppure va spezzato
+   3. invia uno o più segmenti audio a OpenAI Whisper
+   4. ricompone il risultato in un unico file SRT finale
+
+   È quindi il modulo che rende trattabile la sorgente video locale dal punto di vista della trascrizione.
+
+   ### Quando entra in gioco
+
+   Nella pipeline viene usato:
+
+   - quando passi `--whisper`
+   - automaticamente quando usi `--input-mkv`
+
+   In questi casi produce `VIDEO_BASENAME.original.srt`, che poi diventa l’input sia per `srt_to_text_dedup.py` sia per `export_for_llm.py`.
+
+   ### Input
+
+   Input richiesti:
+
+   - `--input-video`: file video sorgente
+   - `--output-srt`: path del file SRT finale
+
+   Parametri di controllo principali:
+
+   - `--model`: modello STT OpenAI, default `whisper-1`
+   - `--language`: lingua attesa, default `it`
+   - `--target-size-mb`: dimensione prudenziale massima per upload
+   - `--audio-bitrate`: bitrate audio usato per il file ottimizzato e per gli eventuali chunk
+
+   ### Output
+
+   Output principale:
+
+   - `WORKDIR/VIDEO_BASENAME.original.srt`
+
+   Output intermedi temporanei:
+
+   - file audio ottimizzato
+   - eventuali chunk audio
+   - trascrizioni parziali usate per comporre il risultato finale
+
+   Gli artefatti intermedi servono solo alla lavorazione interna; ciò che conta per il resto della pipeline è l’SRT finale unico.
+
+   ### Logica operativa
+
+   Il modulo lavora così:
+
+   1. verifica che `ffmpeg` e `ffprobe` siano disponibili
+   2. estrae dal video un audio mono a `16 kHz`
+   3. applica un filtro conservativo per migliorare intelligibilità e uniformità del segnale
+   4. controlla durata e peso del file audio ottimizzato
+   5. se il file è abbastanza piccolo, lo trascrive in un solo passaggio
+   6. se è troppo grande, costruisce un piano di chunk temporali
+   7. eventualmente ri-encoda i chunk finché ciascuno rientra sotto la soglia target
+   8. invia ogni chunk a Whisper
+   9. riallinea i timestamp dei chunk sul tempo assoluto del video
+   10. scrive un unico SRT finale ordinato
+
+   Questa ricomposizione è il punto più importante: i chunk sono solo un dettaglio tecnico interno, mentre a valle tutto deve sembrare un singolo SRT continuo.
+
+   ### Ottimizzazione audio
+
+   L’audio non viene passato all’API così com’è. Il modulo lo ricodifica in modo più adatto alla trascrizione:
+
+   - rimuove il video
+   - converte in mono
+   - porta il sample rate a `16000`
+   - applica filtri `highpass`, `lowpass` e `loudnorm`
+   - usa `libopus` con bitrate basso ma sufficiente
+
+   L’obiettivo non è qualità hi-fi, ma un buon compromesso tra intelligibilità del parlato, peso del file e affidabilità dell’upload.
+
+   ### Chunking
+
+   Se l’audio supera la soglia dimensionale, il modulo non taglia in modo arbitrario “a pezzi fissi” e basta. Prima stima una durata plausibile per chunk sulla base del rapporto tra durata totale e peso del file, poi riduce ulteriormente il chunk se il file generato resta sopra soglia.
+
+   Questo approccio è utile perché:
+
+   - riduce il rischio di fallimenti API per file troppo grandi
+   - evita di generare chunk eccessivamente piccoli
+   - mantiene un equilibrio ragionevole tra numero di richieste e robustezza operativa
+
+   ### Timestamp finali
+
+   Ogni chunk ha una sua timeline locale, ma il file finale deve riferirsi al tempo reale del video. Per questo il modulo somma a ciascun blocco trascritto l’offset temporale del chunk di provenienza e converte tutto nel formato SRT standard `HH:MM:SS,mmm`.
+
+   Senza questo passaggio, i moduli successivi non potrebbero più allineare testo e slide.
+
+   ### Dipendenze principali
+
+   Il modulo usa:
+
+   - `ffmpeg` e `ffprobe` per estrazione audio, ricodifica e durata media
+   - pacchetto Python `openai` per la trascrizione Whisper
+   - librerie standard Python per subprocess, path, JSON, file temporanei e argomenti CLI
+
+   È quindi un modulo leggero dal punto di vista del codice, ma dipendente da tool esterni correttamente installati.
+
+   ### Ruolo nella pipeline complessiva
+
+   Questo modulo è il punto di ingresso della pipeline testuale quando non si parte da sottotitoli già disponibili.
+
+   Se qui qualcosa va storto:
+
+   - non viene generato `VIDEO_BASENAME.original.srt`
+   - salta la preparazione del contesto LLM
+   - salta l’export per slide/chunk
+   - di fatto si blocca tutta la parte testuale del progetto
+
+   ### Limiti pratici
+
+   I limiti principali sono questi:
+
+   - dipende dalla qualità audio del video sorgente
+   - chunk molto lunghi o molto rumorosi possono peggiorare la trascrizione
+   - non fa post-correzione linguistica: produce solo una trascrizione grezza strutturata in SRT
+   - richiede dipendenze esterne correttamente configurate
+
+   In altre parole, è un modulo di acquisizione e normalizzazione, non di “pulizia semantica” del testo.
+
+   ### Riassunto rapido
+
+   In una frase: `whisper_to_srt.py` prende un video locale, ne estrae e ottimizza l’audio, lo trascrive via Whisper anche in più chunk se serve, e produce l’SRT continuo che alimenta tutta la pipeline testuale di Slidescribe.
+
    ## Screenshot_grabber.py
 
    Modulo responsabile dell’estrazione delle slide dal video. Il suo compito non è fare OCR o interpretare il contenuto, ma individuare i cambi slide, salvare le immagini corrette e produrre il file `slides.csv` che verrà poi usato dal resto della pipeline. Il modulo legge un video locale, permette una selezione iniziale interattiva delle aree rilevanti, analizza il video a intervalli regolari e salva una sequenza pulita di slide rettificate.
