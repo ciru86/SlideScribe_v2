@@ -268,12 +268,51 @@ backup_file_if_exists() {
   fi
 }
 
+has_interactive_tty() {
+  : <> /dev/tty 2>/dev/null
+}
+
+require_interactive_tty() {
+  if ! has_interactive_tty; then
+    die "Manca un terminale interattivo: fornisci i parametri richiesti via CLI/config oppure esegui slidescribe da un terminale."
+  fi
+}
+
+derive_workdir_from_youtube_url() {
+  # Deriva un nome cartella ragionevole e filesystem-safe da uno URL YouTube.
+  local url="$1"
+  local candidate=""
+  local sanitized=""
+
+  candidate="$(printf '%s\n' "$url" | sed -E 's#^[a-zA-Z]+://##; s#^[^/]+/##; s#[?&].*$##; s#/$##')"
+  candidate="${candidate##*/}"
+
+  if [ -z "$candidate" ] || [ "$candidate" = "watch" ]; then
+    candidate="$(printf '%s\n' "$url" | sed -nE 's#.*[?&]v=([^&]+).*#\1#p')"
+  fi
+
+  if [ -z "$candidate" ]; then
+    candidate="youtube-video"
+  fi
+
+  sanitized="$(printf '%s' "$candidate" | tr -cs '[:alnum:]._-' '_')"
+  sanitized="${sanitized##_}"
+  sanitized="${sanitized%%_}"
+
+  if [ -z "$sanitized" ]; then
+    sanitized="youtube-video"
+  fi
+
+  printf '%s' "$sanitized"
+}
+
 prompt_nonempty() {
   # Chiede un input obbligatorio all'utente.
   local label="$1"
   local value=""
 
 
+  require_interactive_tty
   while true; do
     printf "%s" "$label" > /dev/tty
     IFS= read -r value < /dev/tty
@@ -290,6 +329,7 @@ prompt_optional() {
   local value
 
 
+  require_interactive_tty
   printf "%s" "$message" > /dev/tty
   IFS= read -r value < /dev/tty
   value="$(trim "$value")"
@@ -302,6 +342,7 @@ prompt_choice_roi() {
   local value=""
 
 
+  require_interactive_tty
   while true; do
     cat > /dev/tty <<'EOF'
 Scegli la modalità ROI:
@@ -1250,6 +1291,8 @@ resolve_inputs() {
       local input_basename
       input_basename="$(basename "$INPUT_MKV" .mkv)"
       WORKDIR="$HOME/Desktop/$input_basename"
+    elif [ -n "$YOUTUBE_URL" ]; then
+      WORKDIR="$(derive_workdir_from_youtube_url "$YOUTUBE_URL")"
     else
       WORKDIR="$(prompt_nonempty 'Inserisci il path della cartella di lavoro: ')"
 
@@ -1284,6 +1327,8 @@ resolve_inputs() {
   if [ -z "$VIDEO_BASENAME" ]; then
       if [ -n "$INPUT_MKV" ]; then
         VIDEO_BASENAME="$(basename "$INPUT_MKV" .mkv)"
+      elif [ -n "$YOUTUBE_URL" ]; then
+        VIDEO_BASENAME="$(derive_workdir_from_youtube_url "$YOUTUBE_URL")"
       else
         VIDEO_BASENAME="$(basename "$WORKDIR")"
       fi
