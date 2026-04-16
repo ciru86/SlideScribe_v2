@@ -19,6 +19,7 @@ DEFAULT_MODEL = "whisper-1"
 DEFAULT_LANGUAGE = "it"
 DEFAULT_TARGET_SIZE_MB = 24
 DEFAULT_AUDIO_BITRATE = "24k"
+DEFAULT_MAX_CHUNK_DURATION_SEC = 900.0
 MIN_CHUNK_DURATION_SEC = 300.0
 
 
@@ -52,6 +53,15 @@ def parse_args() -> argparse.Namespace:
         "--audio-bitrate",
         default=DEFAULT_AUDIO_BITRATE,
         help="Bitrate audio ffmpeg per il file ottimizzato e gli eventuali chunk.",
+    )
+    parser.add_argument(
+        "--max-chunk-duration-sec",
+        type=float,
+        default=DEFAULT_MAX_CHUNK_DURATION_SEC,
+        help=(
+            "Durata massima per singolo chunk audio. "
+            "Serve a evitare upload troppo lunghi anche quando il file resta sotto il limite dimensionale."
+        ),
     )
     return parser.parse_args()
 
@@ -147,19 +157,34 @@ def encode_optimized_audio(input_video: Path, output_audio: Path, bitrate: str) 
     )
 
 
-def build_chunk_plan(audio_path: Path, target_bytes: int) -> List[Tuple[float, float]]:
+def build_chunk_plan(
+    audio_path: Path,
+    target_bytes: int,
+    max_chunk_duration_sec: float,
+) -> List[Tuple[float, float]]:
     size_bytes = audio_path.stat().st_size
     total_duration = ffprobe_duration_seconds(audio_path)
 
-    if size_bytes <= target_bytes:
-        return [(0.0, total_duration)]
+    planned_duration = total_duration
 
-    duration_ratio = target_bytes / float(size_bytes)
-    planned_duration = max(
-        MIN_CHUNK_DURATION_SEC,
-        math.floor(total_duration * duration_ratio * 0.92),
-    )
+    if size_bytes > target_bytes:
+        duration_ratio = target_bytes / float(size_bytes)
+        size_limited_duration = max(
+            MIN_CHUNK_DURATION_SEC,
+            math.floor(total_duration * duration_ratio * 0.92),
+        )
+        planned_duration = min(planned_duration, size_limited_duration)
+
+    if max_chunk_duration_sec > 0:
+        planned_duration = min(
+            planned_duration,
+            max(MIN_CHUNK_DURATION_SEC, max_chunk_duration_sec),
+        )
+
     planned_duration = min(planned_duration, total_duration)
+
+    if planned_duration >= total_duration:
+        return [(0.0, total_duration)]
 
     chunks: List[Tuple[float, float]] = []
     start = 0.0
@@ -349,7 +374,11 @@ def main() -> None:
         eprint("[INFO] Estrazione e ottimizzazione audio per STT...")
         encode_optimized_audio(input_video=input_video, output_audio=optimized_audio, bitrate=args.audio_bitrate)
 
-        chunk_plan = build_chunk_plan(optimized_audio, target_bytes=target_bytes)
+        chunk_plan = build_chunk_plan(
+            optimized_audio,
+            target_bytes=target_bytes,
+            max_chunk_duration_sec=args.max_chunk_duration_sec,
+        )
         eprint(f"[INFO] Chunk audio previsti: {len(chunk_plan)}")
 
         chunk_files: List[Tuple[Path, float]] = []
